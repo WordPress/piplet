@@ -19,6 +19,7 @@ const PHPLET_MAX_REQUEST_BYTES = 5 * 1024 * 1024;
 const PHPLET_MAX_TITLE_BYTES = 240;
 const PHPLET_MAX_TAG_BYTES = 48;
 const PHPLET_MAX_TAGS = 12;
+const PHPLET_MAX_CUSTOM_CSS_BYTES = 32 * 1024;
 const PHPLET_APPEARANCE_DEFAULTS = [
     'palette' => 'quiet',
     'font' => 'editorial',
@@ -31,7 +32,7 @@ const PHPLET_APPEARANCE_OPTIONS = [
     'scale' => ['compact', 'comfortable', 'large'],
     'measure' => ['focused', 'balanced', 'wide'],
 ];
-const PHPLET_APPEARANCE_TOKEN_RULES = [
+const PHPLET_LEGACY_TOKEN_RULES = [
     '--story-width' => ['length', 'rem', 32, 80],
     '--measure' => ['length', 'ch', 42, 90],
     '--sidebar' => ['length', 'rem', 12, 28],
@@ -87,22 +88,35 @@ function phplet_code_offset(): int
     return __COMPILER_HALT_OFFSET__;
 }
 
+function phplet_same_inode(array|false $first, array|false $second): bool
+{
+    return $first !== false && $second !== false
+        && $first['dev'] === $second['dev'] && $first['ino'] === $second['ino'];
+}
+
+function phplet_is_record(mixed $value): bool
+{
+    return is_array($value) && !array_is_list($value);
+}
+
+function phplet_is_note_id(mixed $value): bool
+{
+    return is_string($value) && !ctype_digit($value)
+        && preg_match('/^[a-z0-9][a-z0-9-]{0,79}$/D', $value) === 1;
+}
+
 function phplet_read_stream($handle): string
 {
     if (!rewind($handle)) {
         throw new RuntimeException('Cannot rewind the application file.');
     }
 
-    $raw = '';
-    while (!feof($handle)) {
-        $chunk = fread($handle, 1024 * 1024);
-        if ($chunk === false) {
-            throw new RuntimeException('Cannot read the application file.');
-        }
-        $raw .= $chunk;
-        if (strlen($raw) > PHPLET_MAX_FILE_BYTES) {
-            throw new RuntimeException('The phplet is larger than its configured limit.');
-        }
+    $raw = stream_get_contents($handle, PHPLET_MAX_FILE_BYTES + 1);
+    if ($raw === false) {
+        throw new RuntimeException('Cannot read the application file.');
+    }
+    if (strlen($raw) > PHPLET_MAX_FILE_BYTES) {
+        throw new RuntimeException('The phplet is larger than its configured limit.');
     }
     return $raw;
 }
@@ -167,7 +181,7 @@ function phplet_validate_document(array $document): void
 
     if (array_key_exists('appearance', $document)) {
         $appearance = $document['appearance'];
-        if (!is_array($appearance) || array_is_list($appearance)) {
+        if (!phplet_is_record($appearance)) {
             throw new RuntimeException('Invalid appearance record.');
         }
         if (!isset($appearance['revision']) || !is_int($appearance['revision']) || $appearance['revision'] < 1 || $appearance['revision'] > $document['revision']) {
@@ -177,7 +191,7 @@ function phplet_validate_document(array $document): void
 
     $createTokens = [];
     foreach ($document['notes'] as $id => $note) {
-        if (!is_string($id) || ctype_digit($id) || !preg_match('/^[a-z0-9][a-z0-9-]{0,79}$/D', $id)) {
+        if (!phplet_is_note_id($id)) {
             throw new RuntimeException('Invalid note identifier.');
         }
         if (!is_array($note) || ($note['id'] ?? null) !== $id) {
@@ -266,7 +280,7 @@ function phplet_open_temp(string $path): array
             || (((int) $stat['mode']) & 0170000) !== 0100000
             || (((int) $stat['mode']) & 0077) !== 0
             || ($stat['nlink'] ?? 0) !== 1
-            || $stat['dev'] !== $pathStat['dev'] || $stat['ino'] !== $pathStat['ino']
+            || !phplet_same_inode($stat, $pathStat)
         ) {
             throw new RuntimeException('Cannot open a private temporary snapshot.');
         }
@@ -328,11 +342,7 @@ function phplet_persist(string $prefix, array $document, array $lockedStat): voi
         // Refuse to clobber an out-of-band replacement made while we prepared.
         clearstatcache(true, $path);
         $currentStat = @stat($path);
-        if (
-            $currentStat === false
-            || $currentStat['dev'] !== $lockedStat['dev']
-            || $currentStat['ino'] !== $lockedStat['ino']
-        ) {
+        if (!phplet_same_inode($currentStat, $lockedStat)) {
             throw new RuntimeException('The phplet changed during the save; please retry.');
         }
 
@@ -376,12 +386,7 @@ function phplet_mutate(callable $change): array
             clearstatcache(true, $path);
             $currentStat = @stat($path);
 
-            if (
-                $lockedStat === false
-                || $currentStat === false
-                || $lockedStat['dev'] !== $currentStat['dev']
-                || $lockedStat['ino'] !== $currentStat['ino']
-            ) {
+            if (!phplet_same_inode($lockedStat, $currentStat)) {
                 flock($handle, LOCK_UN);
                 fclose($handle);
                 usleep(random_int(500, 3000));
@@ -460,9 +465,6 @@ function phplet_normalize_tags(mixed $value): array
         }
         $key = strtolower($tag);
         $tags[$key] = $tag;
-        if (count($tags) > PHPLET_MAX_TAGS) {
-            throw new PhpletHttpError(422, 'Use at most 12 tags.');
-        }
     }
     return array_values($tags);
 }
@@ -478,31 +480,15 @@ function phplet_text(mixed $value, string $name, int $maxBytes = PHPLET_MAX_REQU
     return $value;
 }
 
-function phplet_appearance_tokens(mixed $value, bool $strict = true): array
+function phplet_legacy_css(mixed $value): string
 {
     if ($value instanceof stdClass) {
         $value = get_object_vars($value);
     }
-    if ($value === null || $value === []) {
-        return [];
-    }
-    if (!is_array($value) || array_is_list($value)) {
-        if ($strict) {
-            throw new PhpletHttpError(422, 'Design tokens must be an object.');
-        }
-        return [];
-    }
-
-    if ($strict) {
-        foreach ($value as $name => $_) {
-            if (!is_string($name) || !array_key_exists($name, PHPLET_APPEARANCE_TOKEN_RULES)) {
-                throw new PhpletHttpError(422, 'Unsupported design token.');
-            }
-        }
-    }
+    if (!phplet_is_record($value)) return '';
 
     $tokens = [];
-    foreach (PHPLET_APPEARANCE_TOKEN_RULES as $name => $rule) {
+    foreach (PHPLET_LEGACY_TOKEN_RULES as $name => $rule) {
         if (!array_key_exists($name, $value)) {
             continue;
         }
@@ -521,30 +507,29 @@ function phplet_appearance_tokens(mixed $value, bool $strict = true): array
             }
         }
 
-        if (!$valid) {
-            if ($strict) {
-                throw new PhpletHttpError(422, "Invalid design token: $name.");
-            }
-            continue;
-        }
-        $tokens[$name] = $candidate;
+        if ($valid) $tokens[] = "  $name: $candidate;";
     }
-    return $tokens;
+    return $tokens ? ':' . "root {\n" . implode("\n", $tokens) . "\n}" : '';
 }
 
-function phplet_appearance_values(mixed $value): array
+function phplet_appearance_values(mixed $value, bool $strict = true): array
 {
     if ($value instanceof stdClass) {
         $value = get_object_vars($value);
     }
-    if (!is_array($value) || array_is_list($value)) {
-        throw new PhpletHttpError(422, 'Appearance must be an object.');
+    if (!phplet_is_record($value)) {
+        if ($strict) {
+            throw new PhpletHttpError(422, 'Appearance must be an object.');
+        }
+        $value = [];
     }
 
-    $allowed = [...array_keys(PHPLET_APPEARANCE_DEFAULTS), 'tokens'];
-    foreach ($value as $key => $_) {
-        if (!is_string($key) || !in_array($key, $allowed, true)) {
-            throw new PhpletHttpError(422, 'Appearance contains an unsupported setting.');
+    if ($strict) {
+        $allowed = [...array_keys(PHPLET_APPEARANCE_DEFAULTS), 'customCss'];
+        foreach ($value as $key => $_) {
+            if (!is_string($key) || !in_array($key, $allowed, true)) {
+                throw new PhpletHttpError(422, 'Appearance contains an unsupported setting.');
+            }
         }
     }
 
@@ -552,27 +537,32 @@ function phplet_appearance_values(mixed $value): array
     foreach (PHPLET_APPEARANCE_OPTIONS as $key => $options) {
         $choice = $value[$key] ?? null;
         if (!is_string($choice) || !in_array($choice, $options, true)) {
-            throw new PhpletHttpError(422, "Invalid appearance setting: $key.");
+            if ($strict) {
+                throw new PhpletHttpError(422, "Invalid appearance setting: $key.");
+            }
+            $choice = PHPLET_APPEARANCE_DEFAULTS[$key];
         }
         $normalized[$key] = $choice;
     }
-    $normalized['tokens'] = phplet_appearance_tokens($value['tokens'] ?? []);
+    $customCss = $value['customCss'] ?? null;
+    if ($customCss === null) {
+        if ($strict) throw new PhpletHttpError(422, 'Custom CSS must be a string.');
+        $customCss = phplet_legacy_css($value['tokens'] ?? null);
+    }
+    if (!is_string($customCss) || preg_match('//u', $customCss) !== 1 || strlen($customCss) > PHPLET_MAX_CUSTOM_CSS_BYTES) {
+        if ($strict) throw new PhpletHttpError(422, 'Custom CSS must be valid UTF-8 and no larger than 32 KiB.');
+        $customCss = '';
+    }
+    $normalized['customCss'] = $customCss;
     return $normalized;
 }
 
 function phplet_current_appearance(array $document): array
 {
     $stored = $document['appearance'] ?? null;
-    $stored = is_array($stored) && !array_is_list($stored) ? $stored : [];
-    $current = ['revision' => is_int($stored['revision'] ?? null) ? $stored['revision'] : 0];
-    foreach (PHPLET_APPEARANCE_OPTIONS as $key => $options) {
-        $choice = $stored[$key] ?? null;
-        $current[$key] = is_string($choice) && in_array($choice, $options, true)
-            ? $choice
-            : PHPLET_APPEARANCE_DEFAULTS[$key];
-    }
-    $current['tokens'] = phplet_appearance_tokens($stored['tokens'] ?? [], false);
-    return $current;
+    $stored = phplet_is_record($stored) ? $stored : [];
+    return ['revision' => is_int($stored['revision'] ?? null) ? $stored['revision'] : 0]
+        + phplet_appearance_values($stored, false);
 }
 
 function phplet_save_appearance(array $input): array
@@ -594,11 +584,7 @@ function phplet_save_appearance(array $input): array
             return new PhpletUnchanged($current);
         }
         $stored = $document['appearance'] ?? [];
-        $stored = is_array($stored) && !array_is_list($stored) ? $stored : [];
-        $storedTokens = $stored['tokens'] ?? [];
-        $storedTokens = is_array($storedTokens) && !array_is_list($storedTokens) ? $storedTokens : [];
-        $futureTokens = array_diff_key($storedTokens, PHPLET_APPEARANCE_TOKEN_RULES);
-        $values['tokens'] = [...$futureTokens, ...$values['tokens']];
+        $stored = phplet_is_record($stored) ? $stored : [];
         $appearance = [...$stored, 'revision' => $document['revision'] + 1, ...$values];
         $document['appearance'] = $appearance;
         return phplet_current_appearance($document);
@@ -608,7 +594,7 @@ function phplet_save_appearance(array $input): array
 function phplet_save_note(array $input): array
 {
     $id = $input['id'] ?? null;
-    if ($id !== null && (!is_string($id) || ctype_digit($id) || !preg_match('/^[a-z0-9][a-z0-9-]{0,79}$/D', $id))) {
+    if ($id !== null && !phplet_is_note_id($id)) {
         throw new PhpletHttpError(422, 'Invalid note identifier.');
     }
     $baseRevision = $input['baseRevision'] ?? null;
@@ -680,7 +666,7 @@ function phplet_delete_note(array $input): array
 {
     $id = $input['id'] ?? null;
     $baseRevision = $input['baseRevision'] ?? null;
-    if (!is_string($id) || ctype_digit($id) || !preg_match('/^[a-z0-9][a-z0-9-]{0,79}$/D', $id) || !is_int($baseRevision)) {
+    if (!phplet_is_note_id($id) || !is_int($baseRevision)) {
         throw new PhpletHttpError(422, 'Invalid delete request.');
     }
 
@@ -927,19 +913,31 @@ function phplet_run(): void
     $pathStat = @stat($path);
     $writable = is_readable($path) && is_writable(dirname($path)) && ($pathStat['nlink'] ?? 1) === 1;
     $appearance = phplet_current_appearance($document);
+    $safeAppearance = ($_GET['safe'] ?? null) === '1';
     $boot = [
         'document' => $document,
         'appearance' => $appearance,
         'appearanceDefaults' => PHPLET_APPEARANCE_DEFAULTS,
-        'appearanceTokenRules' => PHPLET_APPEARANCE_TOKEN_RULES,
+        'maxCustomCssBytes' => PHPLET_MAX_CUSTOM_CSS_BYTES,
+        'safeAppearance' => $safeAppearance,
         'writable' => $writable,
-        'bytes' => filesize($path),
     ];
     $bootJson = json_encode(
         $boot,
         JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
         | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
     );
+    $customCssJson = json_encode(
+        $safeAppearance ? '' : $appearance['customCss'],
+        JSON_THROW_ON_ERROR | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT
+    );
+    $appearanceGroups = [
+        'palette' => ['Palette', 'Light and dark', 'palette-options'],
+        'font' => ['Reading font', '', ''],
+        'scale' => ['Text size', '', ''],
+        'measure' => ['Line length', 'Wide screens', ''],
+    ];
+    $appearanceLabels = ['compact' => 'Small', 'comfortable' => 'Default'];
 
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
@@ -977,7 +975,7 @@ function phplet_run(): void
             button { color: inherit; }
         }
 
-        /* Appearance tokens and the presets exposed by the interface. */
+        /* Appearance variables and the presets exposed by the interface. */
         @layer theme {
             :root {
                 color-scheme: light;
@@ -1227,7 +1225,7 @@ function phplet_run(): void
             .editor-grid { display: grid; gap: var(--space-5); }
             .field label, .preview-label { display: flex; justify-content: space-between; margin-bottom: .5rem; color: var(--muted); font-size: .72rem; font-weight: 760; letter-spacing: .09em; text-transform: uppercase; }
             .field input, .field textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); color: var(--ink); transition: border-color var(--motion), box-shadow var(--motion); }
-            .field input:focus, .field textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+            .field input:focus, .field textarea:focus, .appearance-custom textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
             .field-title input { padding: .55rem 0; border-width: 0 0 1px; border-radius: 0; font-family: var(--font-copy); font-size: clamp(2rem, 6vw, 3rem); font-weight: 600; letter-spacing: -.03em; }
             .field textarea { min-height: 15rem; resize: vertical; padding: 1rem; font: .94rem/1.65 var(--font-code); tab-size: 2; }
             .field-tags input { min-height: 2.7rem; padding: .6rem .75rem; }
@@ -1235,14 +1233,13 @@ function phplet_run(): void
             .editor-preview { padding: var(--space-5) 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
             .editor-actions { position: sticky; z-index: 5; bottom: 0; display: flex; align-items: center; gap: .6rem; padding: .8rem 0; background: var(--paper); }
             .save-status { min-width: 0; margin-left: .3rem; color: var(--muted); font-size: .8rem; }
-            .save-status[data-kind="error"] { color: var(--danger); }
+            .save-status[data-kind="error"], .global-status[data-kind="error"], .appearance-status[data-kind="error"] { color: var(--danger); }
             .conflict-panel { padding: .9rem; border-left: 3px solid var(--danger); background: var(--danger-wash); color: var(--ink); font-size: .84rem; line-height: 1.5; }
             .conflict-panel p { margin-top: .25rem; color: var(--muted); }
             .conflict-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
             .delete-row { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: var(--space-5); padding: .8rem; border-left: 3px solid var(--danger); background: var(--danger-wash); font-size: .84rem; }
             .delete-row span { margin-right: auto; }
             .global-status { color: var(--muted); }
-            .global-status[data-kind="error"] { color: var(--danger); }
             .appearance-dialog { width: min(calc(100% - 2rem), 40rem); max-height: min(88vh, 48rem); max-height: min(88dvh, 48rem); padding: 0; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); color: var(--ink); box-shadow: var(--shadow); font: 16px/1.45 var(--font-ui); }
             .appearance-dialog::backdrop { background: var(--overlay); }
             .appearance-form { max-height: inherit; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
@@ -1253,7 +1250,7 @@ function phplet_run(): void
             .appearance-intro { margin-bottom: var(--space-5); color: var(--muted); font-size: .87rem; }
             .appearance-group { min-width: 0; margin: 0 0 var(--space-5); padding: 0; border: 0; }
             .appearance-group legend { width: 100%; margin-bottom: .55rem; color: var(--ink); font-size: .78rem; font-weight: 720; }
-            .appearance-group legend span { float: right; color: var(--faint); font-size: .7rem; font-weight: 500; }
+            .appearance-group legend span, .appearance-custom summary span { float: right; color: var(--faint); font-size: .7rem; font-weight: 500; }
             .appearance-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .45rem; }
             .appearance-options.palette-options { grid-template-columns: repeat(4, minmax(0, 1fr)); }
             .appearance-option { position: relative; min-width: 0; cursor: pointer; }
@@ -1266,19 +1263,18 @@ function phplet_run(): void
             .appearance-option input:disabled + span { opacity: .5; }
             .appearance-custom { margin: 0 0 var(--space-5); border: 1px solid var(--line); border-radius: var(--radius); }
             .appearance-custom summary { padding: .8rem .9rem; color: var(--ink); cursor: pointer; font-size: .8rem; font-weight: 720; }
-            .appearance-custom summary span { float: right; color: var(--faint); font-size: .7rem; font-weight: 500; }
             .appearance-custom-body { padding: 0 .9rem .9rem; }
             .appearance-custom-body p { margin-bottom: .65rem; color: var(--muted); font-size: .76rem; line-height: 1.5; }
             .appearance-custom textarea { width: 100%; min-height: 9rem; resize: vertical; padding: .75rem; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--canvas); color: var(--ink); font: .78rem/1.55 var(--font-code); tab-size: 2; }
-            .appearance-custom textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
             .palette-swatch { width: .8rem; height: .8rem; flex: none; border: 1px solid rgb(0 0 0 / .16); border-radius: 50%; background: #176b63; }
             .palette-swatch[data-palette="ocean"] { background: #247dab; }
             .palette-swatch[data-palette="plum"] { background: #8d4b78; }
             .palette-swatch[data-palette="mono"] { background: #686e6a; }
             .appearance-readonly { margin: calc(-1 * var(--space-2)) 0 var(--space-5); padding: .65rem .75rem; border-left: 3px solid var(--danger); background: var(--danger-wash); color: var(--ink); font-size: .78rem; }
+            .safe-appearance { position: fixed; z-index: 100; right: 1rem; bottom: 1rem; max-width: 28rem; padding: .75rem 1rem; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); color: var(--ink); box-shadow: var(--shadow); font: .82rem/1.45 var(--font-ui); }
+            .safe-appearance a { color: var(--accent); font-weight: 700; }
             .appearance-actions { display: flex; align-items: center; gap: .5rem; padding: var(--space-4) var(--space-5); border-top: 1px solid var(--line); background: var(--paper); }
             .appearance-status { min-width: 0; margin-right: auto; color: var(--muted); font-size: .76rem; }
-            .appearance-status[data-kind="error"] { color: var(--danger); }
             .visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
             noscript { display: block; padding: 2rem; font-family: var(--font-ui); }
         }
@@ -1330,13 +1326,15 @@ function phplet_run(): void
             }
         }
     </style>
-    <style nonce="<?= phplet_h($nonce) ?>" id="phplet-token-style">@layer overrides{:root{<?php foreach ($appearance['tokens'] as $name => $value): ?><?= phplet_h($name) ?>:<?= phplet_h($value) ?>;<?php endforeach ?>}}</style>
+    <style nonce="<?= phplet_h($nonce) ?>" id="phplet-custom-style"></style>
+    <script nonce="<?= phplet_h($nonce) ?>">document.getElementById('phplet-custom-style').textContent = <?= $customCssJson ?>;</script>
 </head>
 <body>
     <a class="skip-link" href="#main">Skip to notes</a>
+    <?php if ($safeAppearance): ?><p class="safe-appearance" role="status">Custom CSS is off for this page. You can edit or clear it in Appearance, then <a href="?">leave safe mode</a>.</p><?php endif ?>
     <header class="app-bar">
         <div class="brand"><button class="icon-button mobile-only" id="menu-button" aria-label="Open note index" aria-expanded="false" aria-controls="library"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><span class="brand-mark" aria-hidden="true"></span><span>phplet</span></div>
-        <div class="bar-context"><span class="global-status" id="global-status" aria-live="polite">one file</span><span aria-hidden="true"> · </span><span id="file-size"></span></div>
+        <div class="bar-context" id="bar-context"><span class="global-status" id="global-status" role="status" aria-live="polite" aria-atomic="true"></span></div>
         <div class="bar-actions">
             <button class="button button-quiet appearance-button" id="appearance-button" type="button" aria-haspopup="dialog" aria-controls="appearance-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10m4 0h2M4 17h2m4 0h10M14 4v6M6 14v6"/></svg><span>Appearance</span></button>
             <button class="button button-primary" id="new-button">New note</button>
@@ -1368,45 +1366,22 @@ function phplet_run(): void
                         <label class="appearance-option"><input type="radio" name="appearance-theme" value="dark"><span>Dark</span></label>
                     </div>
                 </fieldset>
+                <?php foreach ($appearanceGroups as $key => [$label, $hint, $class]): ?>
                 <fieldset class="appearance-group appearance-shared">
-                    <legend>Palette <span>Light and dark</span></legend>
-                    <div class="appearance-options palette-options">
-                        <label class="appearance-option"><input type="radio" name="appearance-palette" value="quiet"><span><i class="palette-swatch" data-palette="quiet" aria-hidden="true"></i>Quiet</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-palette" value="ocean"><span><i class="palette-swatch" data-palette="ocean" aria-hidden="true"></i>Ocean</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-palette" value="plum"><span><i class="palette-swatch" data-palette="plum" aria-hidden="true"></i>Plum</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-palette" value="mono"><span><i class="palette-swatch" data-palette="mono" aria-hidden="true"></i>Mono</span></label>
+                    <legend><?= phplet_h($label) ?><?php if ($hint !== ''): ?> <span><?= phplet_h($hint) ?></span><?php endif ?></legend>
+                    <div class="appearance-options <?= phplet_h($class) ?>">
+                        <?php foreach (PHPLET_APPEARANCE_OPTIONS[$key] as $value): ?>
+                        <label class="appearance-option"><input type="radio" name="appearance-<?= phplet_h($key) ?>" value="<?= phplet_h($value) ?>"><span><?php if ($key === 'palette'): ?><i class="palette-swatch" data-palette="<?= phplet_h($value) ?>" aria-hidden="true"></i><?php endif ?><?= phplet_h($appearanceLabels[$value] ?? ucfirst($value)) ?></span></label>
+                        <?php endforeach ?>
                     </div>
                 </fieldset>
-                <fieldset class="appearance-group appearance-shared">
-                    <legend>Reading font</legend>
-                    <div class="appearance-options">
-                        <label class="appearance-option"><input type="radio" name="appearance-font" value="editorial"><span>Editorial</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-font" value="modern"><span>Modern</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-font" value="typewriter"><span>Typewriter</span></label>
-                    </div>
-                </fieldset>
-                <fieldset class="appearance-group appearance-shared">
-                    <legend>Text size</legend>
-                    <div class="appearance-options">
-                        <label class="appearance-option"><input type="radio" name="appearance-scale" value="compact"><span>Small</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-scale" value="comfortable"><span>Default</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-scale" value="large"><span>Large</span></label>
-                    </div>
-                </fieldset>
-                <fieldset class="appearance-group appearance-shared">
-                    <legend>Line length <span>Wide screens</span></legend>
-                    <div class="appearance-options">
-                        <label class="appearance-option"><input type="radio" name="appearance-measure" value="focused"><span>Focused</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-measure" value="balanced"><span>Balanced</span></label>
-                        <label class="appearance-option"><input type="radio" name="appearance-measure" value="wide"><span>Wide</span></label>
-                    </div>
-                </fieldset>
+                <?php endforeach ?>
                 <details class="appearance-custom appearance-shared">
-                    <summary>Design tokens <span>CSS variables</span></summary>
+                    <summary>Custom CSS <span>32 KiB max</span></summary>
                     <div class="appearance-custom-body">
-                        <p>Optional layout overrides, one per line. Try <code>--story-width: 60rem;</code>, <code>--measure: 72ch;</code>, or <code>--radius: 10px;</code>. Overrides take precedence over related presets until removed; color remains coordinated by the accessible palettes above.</p>
-                        <label class="visually-hidden" for="appearance-tokens">Custom CSS variables</label>
-                        <textarea id="appearance-tokens" name="appearance-tokens" spellcheck="false" autocomplete="off" placeholder="--story-width: 60rem;&#10;--measure: 72ch;&#10;--radius: 10px;"></textarea>
+                        <p>This stylesheet comes after the built-in theme and can change any selector. Remote assets are blocked. If a rule makes the interface unusable, reopen the page with <code>?safe=1</code>.</p>
+                        <label class="visually-hidden" for="appearance-css">Custom CSS</label>
+                        <textarea id="appearance-css" name="appearance-css" spellcheck="false" autocomplete="off" placeholder=":root { --story-width: 60rem; }&#10;.note-title { letter-spacing: 0; }"></textarea>
                     </div>
                 </details>
                 <p class="appearance-readonly" id="appearance-readonly" hidden>This file is read-only. Theme can still be saved on this device.</p>
@@ -1430,12 +1405,12 @@ function phplet_run(): void
         const notes = new Map(Object.entries(boot.document.notes || {}));
         const els = Object.fromEntries([
             'story', 'library-list', 'search-input', 'note-count', 'new-button',
-            'global-status', 'file-size', 'storage-state', 'menu-button',
+            'bar-context', 'global-status', 'storage-state', 'menu-button',
             'drawer-shade', 'library', 'main', 'appearance-button',
             'appearance-dialog', 'appearance-form', 'appearance-close',
             'appearance-reset', 'appearance-cancel', 'appearance-save',
-            'appearance-status', 'appearance-readonly', 'appearance-tokens',
-            'phplet-token-style'
+            'appearance-status', 'appearance-readonly', 'appearance-css',
+            'phplet-custom-style'
         ].map(id => [id, document.getElementById(id)]));
         const storageScope = `phplet:${location.pathname}:`;
         const themeStorageKey = `${storageScope}theme`;
@@ -1443,9 +1418,18 @@ function phplet_run(): void
         const colorScheme = matchMedia('(prefers-color-scheme: dark)');
         const appearanceDefaults = Object.freeze(boot.appearanceDefaults);
         const appearanceKeys = Object.keys(appearanceDefaults);
-        const tokenRules = Object.freeze(boot.appearanceTokenRules);
         const maxOpenNotes = 20;
         const maxLibraryNotes = 40;
+
+        function safeStorage(name) {
+            return {
+                read(key) { try { return window[name].getItem(key); } catch (_) { return null; } },
+                write(key, value) { try { window[name].setItem(key, value); return true; } catch (_) { return false; } },
+                remove(key) { try { window[name].removeItem(key); return true; } catch (_) { return false; } }
+            };
+        }
+        const {read: sessionRead, write: sessionWrite, remove: sessionRemove} = safeStorage('sessionStorage');
+        const {read: localRead, write: localWrite} = safeStorage('localStorage');
 
         let openNotes = readOpenNotes();
         let editing = null;
@@ -1454,37 +1438,13 @@ function phplet_run(): void
         let draftTimer = null;
         let previewTimer = null;
         let searchTimer = null;
+        let globalStatusTimer = null;
         let noteSaving = false;
-        let savedAppearance = {...appearanceDefaults, ...boot.appearance, tokens: {...(boot.appearance.tokens || {})}};
+        let savedAppearance = {...appearanceDefaults, ...boot.appearance};
         let appearanceDraft = null;
         let savedThemeChoice = readThemeChoice();
         let themeDraft = savedThemeChoice;
         let appearanceSaving = false;
-
-        function sessionRead(key) {
-            try { return window.sessionStorage.getItem(key); }
-            catch (_) { return null; }
-        }
-
-        function sessionWrite(key, value) {
-            try { window.sessionStorage.setItem(key, value); return true; }
-            catch (_) { return false; }
-        }
-
-        function sessionRemove(key) {
-            try { window.sessionStorage.removeItem(key); return true; }
-            catch (_) { return false; }
-        }
-
-        function localRead(key) {
-            try { return window.localStorage.getItem(key); }
-            catch (_) { return null; }
-        }
-
-        function localWrite(key, value) {
-            try { window.localStorage.setItem(key, value); return true; }
-            catch (_) { return false; }
-        }
 
         function readThemeChoice() {
             const choice = localRead(themeStorageKey) || 'system';
@@ -1500,45 +1460,8 @@ function phplet_run(): void
         function appearanceValues(record) {
             return {
                 ...Object.fromEntries(appearanceKeys.map(key => [key, record[key] || appearanceDefaults[key]])),
-                tokens: {...(record.tokens || {})}
+                customCss: typeof record.customCss === 'string' ? record.customCss : ''
             };
-        }
-
-        function normalizeToken(name, value) {
-            const rule = tokenRules[name];
-            const candidate = String(value).trim();
-            if (!rule) throw new Error(`Unsupported design token: ${name}`);
-            const match = candidate.match(new RegExp(`^((?:0|[1-9][0-9]*)(?:\\.[0-9]{1,2})?)${rule[1]}$`));
-            const number = match ? Number(match[1]) : NaN;
-            if (!Number.isFinite(number) || number < rule[2] || number > rule[3]) {
-                throw new Error(`${name} needs ${rule[2]}–${rule[3]}${rule[1]}.`);
-            }
-            return `${number}${rule[1]}`;
-        }
-
-        function parseTokens(source) {
-            const tokens = {};
-            for (const [lineNumber, raw] of String(source).split(/\r?\n/).entries()) {
-                const line = raw.trim();
-                if (!line) continue;
-                const match = line.match(/^(--[a-z-]+)\s*:\s*([^;]+);?$/);
-                if (!match) throw new Error(`Design token line ${lineNumber + 1} is not “--name: value;”.`);
-                if (Object.hasOwn(tokens, match[1])) throw new Error(`Design token ${match[1]} appears twice.`);
-                tokens[match[1]] = normalizeToken(match[1], match[2]);
-            }
-            return Object.fromEntries(Object.keys(tokenRules).filter(name => Object.hasOwn(tokens, name)).map(name => [name, tokens[name]]));
-        }
-
-        function writeTokens(tokens) {
-            return Object.keys(tokenRules)
-                .filter(name => Object.hasOwn(tokens || {}, name))
-                .map(name => `${name}: ${tokens[name]};`)
-                .join('\n');
-        }
-
-        function applyTokens(tokens) {
-            const declarations = Object.entries(tokens || {}).map(([name, value]) => `${name}:${value};`).join('');
-            els['phplet-token-style'].textContent = `@layer overrides{:root{${declarations}}}`;
         }
 
         function applyAppearance(record) {
@@ -1546,7 +1469,7 @@ function phplet_run(): void
             for (const key of appearanceKeys) {
                 document.documentElement.dataset[key] = values[key];
             }
-            applyTokens(values.tokens);
+            els['phplet-custom-style'].textContent = boot.safeAppearance ? '' : values.customCss;
         }
 
         function contrastRatio(first, second) {
@@ -1571,12 +1494,12 @@ function phplet_run(): void
 
         function writeAppearanceForm() {
             const values = appearanceValues(appearanceDraft || savedAppearance);
-            const choices = {theme: themeDraft, ...values};
+            const choices = {theme: themeDraft, ...Object.fromEntries(appearanceKeys.map(key => [key, values[key]]))};
             for (const [key, value] of Object.entries(choices)) {
                 const input = els['appearance-form'].querySelector(`input[name="appearance-${key}"][value="${value}"]`);
                 if (input) input.checked = true;
             }
-            els['appearance-tokens'].value = writeTokens(values.tokens);
+            els['appearance-css'].value = values.customCss;
         }
 
         function readAppearanceForm() {
@@ -1584,12 +1507,12 @@ function phplet_run(): void
             themeDraft = String(data.get('appearance-theme') || themeDraft);
             const choices = {
                 ...Object.fromEntries(appearanceKeys.map(key => [key, String(data.get(`appearance-${key}`) || appearanceDraft?.[key] || appearanceDefaults[key])])),
-                tokens: {...(appearanceDraft?.tokens || savedAppearance.tokens || {})}
+                customCss: els['appearance-css'].value
             };
+            if (new Blob([choices.customCss]).size > boot.maxCustomCssBytes) throw new Error('Custom CSS must be no larger than 32 KiB.');
             appearanceDraft = choices;
             applyTheme(themeDraft);
             applyAppearance(appearanceDraft);
-            appearanceDraft = {...choices, tokens: parseTokens(els['appearance-tokens'].value)};
         }
 
         function previewAppearance() {
@@ -1650,7 +1573,7 @@ function phplet_run(): void
 
         function restoreAppearanceDefaults() {
             themeDraft = 'system';
-            if (boot.writable) appearanceDraft = {...appearanceDefaults, tokens: {}};
+            if (boot.writable) appearanceDraft = {...appearanceDefaults, customCss: ''};
             writeAppearanceForm();
             applyTheme(themeDraft);
             applyAppearance(appearanceDraft || savedAppearance);
@@ -1667,13 +1590,18 @@ function phplet_run(): void
             return node;
         }
 
-        function iconButton(label, path, onClick) {
-            const button = element('button', 'icon-button');
+        function textButton(text, className, onClick) {
+            const button = element('button', className, text);
             button.type = 'button';
+            button.addEventListener('click', onClick);
+            return button;
+        }
+
+        function iconButton(label, path, onClick) {
+            const button = textButton('', 'icon-button', onClick);
             button.setAttribute('aria-label', label);
             button.title = label;
             button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${path}"/></svg>`;
-            button.addEventListener('click', onClick);
             return button;
         }
 
@@ -1704,10 +1632,10 @@ function phplet_run(): void
             sessionWrite(`${storageScope}open`, JSON.stringify(openNotes));
         }
 
-        function humanBytes(bytes) {
-            if (bytes < 1024) return `${bytes} B`;
-            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-            return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+        function replaceHash(id = openNotes[0]) {
+            history.replaceState(null, '', id
+                ? `#${encodeURIComponent(id)}`
+                : `${location.pathname}${location.search}`);
         }
 
         function shortDate(value) {
@@ -1715,9 +1643,25 @@ function phplet_run(): void
             return Number.isNaN(date.valueOf()) ? '' : new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric', year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric'}).format(date);
         }
 
-        function setGlobalStatus(message, kind = '') {
+        function clearGlobalStatus() {
+            clearTimeout(globalStatusTimer);
+            globalStatusTimer = null;
+            els['global-status'].dataset.kind = '';
+            els['global-status'].textContent = '';
+        }
+
+        function clearTransientGlobalStatus() {
+            if (globalStatusTimer !== null) clearGlobalStatus();
+        }
+
+        function setGlobalStatus(message, kind = '', transient = kind === '') {
+            clearTimeout(globalStatusTimer);
+            globalStatusTimer = null;
             els['global-status'].dataset.kind = kind;
             els['global-status'].textContent = message;
+            if (message && transient) {
+                globalStatusTimer = setTimeout(clearGlobalStatus, 4000);
+            }
         }
 
         function updateDrawerAccess() {
@@ -1777,7 +1721,7 @@ function phplet_run(): void
             if (noteSaving || !notes.has(id)) return;
             openNotes = prioritizeOpenNote(id);
             saveOpenNotes();
-            if (updateHash) history.replaceState(null, '', `#${encodeURIComponent(id)}`);
+            if (updateHash) replaceHash(id);
             render();
             closeDrawer();
             requestAnimationFrame(() => {
@@ -1798,7 +1742,7 @@ function phplet_run(): void
             }
             openNotes = openNotes.filter(open => open !== id);
             saveOpenNotes();
-            history.replaceState(null, '', openNotes[0] ? `#${encodeURIComponent(openNotes[0])}` : `${location.pathname}${location.search}`);
+            replaceHash();
             render();
             requestAnimationFrame(() => {
                 const target = openNotes[0] ? document.querySelector(`#phplet-note-${CSS.escape(openNotes[0])} .note-title`) : els['new-button'];
@@ -1818,13 +1762,11 @@ function phplet_run(): void
             els['library-list'].replaceChildren();
             for (const note of filtered.slice(0, maxLibraryNotes)) {
                 const li = element('li');
-                const button = element('button', 'library-item');
-                button.type = 'button';
+                const button = textButton('', 'library-item', () => openNote(note.id));
                 button.setAttribute('aria-current', openNotes[0] === note.id ? 'true' : 'false');
                 button.append(element('span', 'library-title', note.title));
                 const meta = note.tags.length ? note.tags.map(tag => `#${tag}`).join(' · ') : `Edited ${shortDate(note.updated)}`;
                 button.append(element('span', 'library-meta', meta));
-                button.addEventListener('click', () => openNote(note.id));
                 li.append(button);
                 els['library-list'].append(li);
             }
@@ -1928,19 +1870,14 @@ function phplet_run(): void
                     root.append(h); budget.nodes++; index++; continue;
                 }
                 if (/^---+$/.test(line.trim())) { root.append(element('hr')); budget.nodes++; index++; continue; }
-                if (/^[-*]\s+/.test(line)) {
-                    const list = element('ul');
+                const listMatch = line.match(/^([-*]|\d+\.)\s+/);
+                if (listMatch) {
+                    const ordered = /^\d/.test(listMatch[1]);
+                    const itemPattern = ordered ? /^\d+\.\s+/ : /^[-*]\s+/;
+                    const list = element(ordered ? 'ol' : 'ul');
                     budget.nodes++;
-                    while (index < lines.length && !budget.exhausted && budget.nodes <= budget.max && /^[-*]\s+/.test(lines[index])) {
-                        const item = element('li'); appendInline(item, lines[index].replace(/^[-*]\s+/, ''), budget); list.append(item); budget.nodes++; index++;
-                    }
-                    root.append(list); continue;
-                }
-                if (/^\d+\.\s+/.test(line)) {
-                    const list = element('ol');
-                    budget.nodes++;
-                    while (index < lines.length && !budget.exhausted && budget.nodes <= budget.max && /^\d+\.\s+/.test(lines[index])) {
-                        const item = element('li'); appendInline(item, lines[index].replace(/^\d+\.\s+/, ''), budget); list.append(item); budget.nodes++; index++;
+                    while (index < lines.length && !budget.exhausted && budget.nodes <= budget.max && itemPattern.test(lines[index])) {
+                        const item = element('li'); appendInline(item, lines[index].replace(itemPattern, ''), budget); list.append(item); budget.nodes++; index++;
                     }
                     root.append(list); continue;
                 }
@@ -1968,16 +1905,14 @@ function phplet_run(): void
         }
 
         function tagButton(tag) {
-            const button = element('button', 'tag', tag);
-            button.type = 'button';
-            button.title = `Find notes tagged ${tag}`;
-            button.addEventListener('click', () => {
+            const button = textButton(tag, 'tag', () => {
                 query = `#${tag}`;
                 els['search-input'].value = query;
                 renderLibrary();
                 if (mobileViewport.matches) openDrawer();
                 els['search-input'].focus();
             });
+            button.title = `Find notes tagged ${tag}`;
             return button;
         }
 
@@ -2004,14 +1939,12 @@ function phplet_run(): void
                 row.setAttribute('role', 'group');
                 row.setAttribute('aria-label', 'Confirm deletion');
                 row.append(element('span', '', 'Delete this note? This cannot be undone.'));
-                const cancel = element('button', 'button button-quiet', 'Keep it');
-                cancel.type = 'button'; cancel.addEventListener('click', () => {
+                const cancel = textButton('Keep it', 'button button-quiet', () => {
                     pendingDelete = null;
                     renderStory();
                     requestAnimationFrame(() => document.querySelector(`#phplet-note-${CSS.escape(note.id)} .note-title`)?.focus());
                 });
-                const remove = element('button', 'button button-danger', 'Delete note');
-                remove.type = 'button'; remove.addEventListener('click', () => deleteNote(note));
+                const remove = textButton('Delete note', 'button button-danger', () => deleteNote(note));
                 row.append(cancel, remove); article.append(row);
             }
             return article;
@@ -2174,7 +2107,7 @@ function phplet_run(): void
             if (!target) return false;
             const component = new Set([...draftPreviousKeys(source), ...sourceKeys].filter(isDraftKey));
             if (component.has(key)) return false;
-            if (linkedDraftKeys(target, candidates).some(linked => component.has(linked))) return false;
+            if (traceDraft(target, candidates).keys.some(linked => component.has(linked))) return false;
             return draftFingerprint(target.draft) !== draftFingerprint(source);
         }
 
@@ -2185,40 +2118,27 @@ function phplet_run(): void
             return superseded;
         }
 
-        function linkedDraftKeys(candidate, candidates) {
-            const byKey = new Map(candidates.map(item => [item.key, item]));
-            const seen = new Set([candidate.key]);
-            const linked = [];
-            const pending = [...draftPreviousKeys(candidate.draft)];
-            while (pending.length) {
-                const key = pending.shift();
-                if (!isDraftKey(key) || seen.has(key)) continue;
-                seen.add(key);
-                linked.push(key);
-                const predecessor = byKey.get(key);
-                if (predecessor) pending.push(...draftPreviousKeys(predecessor.draft));
-            }
-            return linked;
-        }
-
-        function draftHasCycle(candidate, candidates) {
+        function traceDraft(candidate, candidates) {
             const byKey = new Map(candidates.map(item => [item.key, item]));
             const seen = new Set();
+            const keys = [];
+            let cyclic = false;
             const pending = [...draftPreviousKeys(candidate.draft)];
             while (pending.length) {
                 const key = pending.shift();
-                if (key === candidate.key) return true;
+                if (key === candidate.key) { cyclic = true; continue; }
                 if (!isDraftKey(key) || seen.has(key)) continue;
                 seen.add(key);
+                keys.push(key);
                 const predecessor = byKey.get(key);
                 if (predecessor) pending.push(...draftPreviousKeys(predecessor.draft));
             }
-            return false;
+            return {keys, cyclic};
         }
 
         function expandedDraft(candidate, candidates) {
             const draft = {...candidate.draft};
-            const previousKeys = linkedDraftKeys(candidate, candidates);
+            const previousKeys = traceDraft(candidate, candidates).keys;
             delete draft.previousDraftKey;
             delete draft.previousDraftKeys;
             if (previousKeys.length) draft.previousDraftKeys = previousKeys;
@@ -2256,9 +2176,9 @@ function phplet_run(): void
                 const canonicalComposer = candidates.find(({key}) => key === draftKey(null));
                 const competingComposer = candidates.some(({key, id}) => key !== draftKey(null)
                     && !superseded.has(key) && (id === null || !notes.has(id)));
-                const cycleOwner = canonicalComposer && draftHasCycle(canonicalComposer, candidates)
+                const cycleOwner = canonicalComposer && traceDraft(canonicalComposer, candidates).cyclic
                     ? canonicalComposer
-                    : candidates.find(candidate => draftHasCycle(candidate, candidates));
+                    : candidates.find(candidate => traceDraft(candidate, candidates).cyclic);
                 // Never migrate another recovery into draft:@new over an
                 // independent composer. Make the owner resolve first, then
                 // drain the legacy/orphan component on the next entry.
@@ -2319,10 +2239,7 @@ function phplet_run(): void
         function recoverReadOnlyDraft() {
             try {
                 const candidates = storedDraftCandidates();
-                const candidateKeys = new Set(candidates.map(({key}) => key));
-                const superseded = new Set(candidates
-                    .flatMap(({draft}) => draftPreviousKeys(draft))
-                    .filter(key => candidateKeys.has(key)));
+                const superseded = supersededDraftKeys(candidates);
                 const recovered = candidates.find(({key}) => !superseded.has(key)) || candidates[0];
                 if (recovered) {
                     const draft = expandedDraft(recovered, candidates);
@@ -2452,11 +2369,9 @@ function phplet_run(): void
             body.value = editing.body;
             body.setAttribute('aria-label', 'Recovered draft text');
             const actions = element('div', 'editor-actions');
-            const dismiss = element('button', 'button button-quiet', 'Dismiss recovery');
-            dismiss.type = 'button';
             const status = element('span', 'save-status');
             status.setAttribute('aria-live', 'polite');
-            dismiss.addEventListener('click', () => {
+            const dismiss = textButton('Dismiss recovery', 'button button-quiet', () => {
                 const staleCleared = removeDrafts(draftPreviousKeys(editing));
                 if (!staleCleared || !removeDraft(editing.recoveryKey)) {
                     status.dataset.kind = 'error';
@@ -2516,11 +2431,14 @@ function phplet_run(): void
                     : `Your draft is preserved. The saved version is revision ${current?.revision || 'unknown'}.`));
                 const choices = element('div', 'conflict-actions');
                 if (editor.conflict.deleted) {
-                    const keep = element('button', 'button button-primary', 'Save as new'); keep.type = 'button';
-                    keep.addEventListener('click', () => {
+                    const keep = textButton('Save as new', 'button button-primary', () => {
                         if (noteSaving || editing !== editor) return;
                         const oldKey = draftKey(editor.id);
                         if (editor.id !== null && independentDraftAt(draftKey(null), editor, [oldKey])) {
+                            if (!flushDraft()) {
+                                setEditorStatus('This draft could not be stored, so the other recovery was not opened. Keep this editor open.');
+                                return;
+                            }
                             const destination = readDraft(null);
                             if (destination) {
                                 openRecoveryEditor(destination);
@@ -2543,8 +2461,7 @@ function phplet_run(): void
                         render();
                         requestAnimationFrame(() => document.querySelector('#edit-title')?.focus());
                     });
-                    const discard = element('button', 'button button-quiet', 'Discard draft'); discard.type = 'button';
-                    discard.addEventListener('click', () => {
+                    const discard = textButton('Discard draft', 'button button-quiet', () => {
                         if (noteSaving || editing !== editor) return;
                         if (!removeDrafts(draftPreviousKeys(editor), draftKey(editor.id))) {
                             setEditorStatus('This browser could not discard its recovery copy. The editor is still open.');
@@ -2556,8 +2473,7 @@ function phplet_run(): void
                     });
                     choices.append(keep, discard);
                 } else if (current) {
-                    const replace = element('button', 'button button-primary', 'Replace saved version'); replace.type = 'button';
-                    replace.addEventListener('click', () => {
+                    const replace = textButton('Replace saved version', 'button button-primary', () => {
                         if (noteSaving || editing !== editor) return;
                         editor.baseRevision = current.revision;
                         delete editor.conflict;
@@ -2565,8 +2481,7 @@ function phplet_run(): void
                         render();
                         requestAnimationFrame(() => document.querySelector('#edit-body')?.focus());
                     });
-                    const useSaved = element('button', 'button button-quiet', 'Use saved version'); useSaved.type = 'button';
-                    useSaved.addEventListener('click', () => {
+                    const useSaved = textButton('Use saved version', 'button button-quiet', () => {
                         if (noteSaving || editing !== editor) return;
                         if (!removeDrafts(draftPreviousKeys(editor), draftKey(editor.id))) {
                             setEditorStatus('This browser could not discard its recovery copy. The editor is still open.');
@@ -2584,15 +2499,13 @@ function phplet_run(): void
 
             const actions = element('div', 'editor-actions');
             const save = element('button', 'button button-primary', 'Save note'); save.type = 'submit';
-            const cancel = element('button', 'button button-quiet', 'Cancel'); cancel.type = 'button';
-            cancel.addEventListener('click', cancelEditing);
+            const cancel = textButton('Cancel', 'button button-quiet', cancelEditing);
             const status = element('span', 'save-status', editor.recoveryWarning || (editor.conflict ? 'Choose how to resolve the saved-version conflict.' : 'Changes stay in this browser until you save.'));
             status.setAttribute('aria-live', 'polite');
             if (editor.recoveryWarning) status.dataset.kind = 'error';
             actions.append(save, cancel);
             if (editor.id) {
-                const remove = element('button', 'button button-quiet', 'Delete'); remove.type = 'button';
-                remove.addEventListener('click', () => {
+                const remove = textButton('Delete', 'button button-quiet', () => {
                     if (noteSaving || editing !== editor) return;
                     if (!flushDraft()) {
                         status.dataset.kind = 'error';
@@ -2657,15 +2570,14 @@ function phplet_run(): void
                     const note = response.result;
                     notes.set(note.id, note);
                     boot.document.revision = response.documentRevision;
-                    boot.bytes = null;
                     const draftsCleared = removeDrafts(draftPreviousKeys(editor), oldKey);
                     openNotes = prioritizeOpenNote(note.id);
                     if (editing === editor) editing = null;
                     noteSaving = false;
                     setBusy(false);
                     saveOpenNotes();
-                    setGlobalStatus(draftsCleared ? 'Saved in this file' : 'Saved in this file; browser recovery could not be cleared', draftsCleared ? '' : 'error');
-                    history.replaceState(null, '', `#${encodeURIComponent(note.id)}`);
+                    setGlobalStatus(draftsCleared ? `Saved: ${note.title}` : `Saved: ${note.title}; browser recovery could not be cleared`, draftsCleared ? '' : 'error');
+                    replaceHash(note.id);
                     render();
                     requestAnimationFrame(() => document.querySelector(`#phplet-note-${CSS.escape(note.id)} .note-title`)?.focus());
                 } catch (error) {
@@ -2677,6 +2589,11 @@ function phplet_run(): void
                             notes.set(current.id, current);
                             const conflictKey = draftKey(current.id);
                             if (editor.id === null && independentDraftAt(conflictKey, editor, [oldKey])) {
+                                if (!flushDraft()) {
+                                    status.dataset.kind = 'error';
+                                    status.textContent = 'This draft could not be stored, so the other recovery was not opened. Keep this editor open.';
+                                    return;
+                                }
                                 const destination = readDraft(current);
                                 if (destination) {
                                     openRecoveryEditor(destination);
@@ -2688,7 +2605,7 @@ function phplet_run(): void
                                 editor.id = current.id;
                                 openNotes = prioritizeOpenNote(editor.id);
                                 saveOpenNotes();
-                                history.replaceState(null, '', `#${encodeURIComponent(editor.id)}`);
+                                replaceHash(editor.id);
                             }
                             editor.conflict = {deleted: false};
                             if (!persistDraft(conflictKey, editor, [oldKey]) && !editor.recoveryWarning) {
@@ -2699,9 +2616,7 @@ function phplet_run(): void
                                 notes.delete(editor.id);
                                 openNotes = openNotes.filter(id => id !== editor.id);
                                 saveOpenNotes();
-                                history.replaceState(null, '', openNotes[0]
-                                    ? `#${encodeURIComponent(openNotes[0])}`
-                                    : `${location.pathname}${location.search}`);
+                                replaceHash();
                             }
                             editor.conflict = {deleted: true};
                             if (editor.id !== null && independentDraftAt(draftKey(null), editor, [oldKey])) {
@@ -2754,20 +2669,19 @@ function phplet_run(): void
             noteSaving = true;
             els['new-button'].disabled = true;
             els['appearance-button'].disabled = true;
-            setGlobalStatus('Deleting…');
+            setGlobalStatus(`Deleting: ${note.title}…`, '', false);
             try {
                 const response = await api('delete', {id: note.id, baseRevision: note.revision});
                 notes.delete(note.id);
                 const draftCleared = removeDraft(draftKey(note.id));
                 openNotes = openNotes.filter(id => id !== note.id);
-                history.replaceState(null, '', openNotes[0] ? `#${encodeURIComponent(openNotes[0])}` : `${location.pathname}${location.search}`);
+                replaceHash();
                 pendingDelete = null;
                 boot.document.revision = response.documentRevision;
-                boot.bytes = null;
                 noteSaving = false;
                 els['appearance-button'].disabled = false;
                 saveOpenNotes();
-                setGlobalStatus(draftCleared ? 'Note deleted' : 'Note deleted; browser recovery could not be cleared', draftCleared ? '' : 'error');
+                setGlobalStatus(draftCleared ? `Deleted: ${note.title}` : `Deleted: ${note.title}; browser recovery could not be cleared`, draftCleared ? '' : 'error');
                 render();
                 requestAnimationFrame(() => {
                     const target = openNotes[0] ? document.querySelector(`#phplet-note-${CSS.escape(openNotes[0])} .note-title`) : els['new-button'];
@@ -2782,7 +2696,7 @@ function phplet_run(): void
                     else {
                         notes.delete(note.id);
                         openNotes = openNotes.filter(id => id !== note.id);
-                        history.replaceState(null, '', openNotes[0] ? `#${encodeURIComponent(openNotes[0])}` : `${location.pathname}${location.search}`);
+                        replaceHash();
                     }
                 }
                 setGlobalStatus(error.status === 409 ? 'That note changed; delete cancelled.' : error.message, 'error');
@@ -2812,7 +2726,7 @@ function phplet_run(): void
                 empty.append(element('h2', '', notes.size ? 'Choose a note.' : 'No notes yet.'));
                 empty.append(element('p', '', notes.size ? 'Use the index, or create a new note.' : 'Create one here. Saving makes it part of this PHP file.'));
                 if (boot.writable) {
-                    const start = element('button', 'button button-primary', 'Write a note'); start.type = 'button'; start.addEventListener('click', newNote); empty.append(start);
+                    empty.append(textButton('Write a note', 'button button-primary', newNote));
                 }
                 els.story.append(empty);
             }
@@ -2823,9 +2737,10 @@ function phplet_run(): void
             renderStory();
             els['new-button'].disabled = !boot.writable || noteSaving;
             els['storage-state'].textContent = boot.writable ? '' : 'Read-only';
-            els['file-size'].textContent = boot.bytes ? humanBytes(boot.bytes) : 'Saved';
         }
 
+        document.addEventListener('click', clearTransientGlobalStatus, true);
+        document.addEventListener('keydown', clearTransientGlobalStatus, true);
         els['appearance-button'].addEventListener('click', openAppearance);
         els['appearance-form'].addEventListener('input', previewAppearance);
         els['appearance-close'].addEventListener('click', () => closeAppearance());
@@ -2841,18 +2756,7 @@ function phplet_run(): void
             if (!previewAppearance()) return;
             const sharedChanged = JSON.stringify(appearanceValues(appearanceDraft)) !== JSON.stringify(appearanceValues(savedAppearance));
             const themeChanged = themeDraft !== savedThemeChoice;
-            if (!boot.writable) {
-                if (themeChanged && !localWrite(themeStorageKey, themeDraft)) {
-                    els['appearance-status'].dataset.kind = 'error';
-                    els['appearance-status'].textContent = 'This browser could not store the theme.';
-                    return;
-                }
-                savedThemeChoice = themeDraft;
-                closeAppearance(true);
-                setGlobalStatus(themeChanged ? 'Theme saved on this device' : 'No appearance changes');
-                return;
-            }
-            if (!sharedChanged) {
+            if (!boot.writable || !sharedChanged) {
                 if (themeChanged && !localWrite(themeStorageKey, themeDraft)) {
                     els['appearance-status'].dataset.kind = 'error';
                     els['appearance-status'].textContent = 'This browser could not store the theme.';
@@ -2872,21 +2776,19 @@ function phplet_run(): void
                     baseRevision: savedAppearance.revision,
                     appearance: appearanceValues(appearanceDraft)
                 });
-                savedAppearance = {...appearanceDefaults, ...response.result, tokens: {...(response.result.tokens || {})}};
+                savedAppearance = {...appearanceDefaults, ...response.result};
                 boot.appearance = savedAppearance;
                 boot.document.revision = response.documentRevision;
-                boot.bytes = null;
-                els['file-size'].textContent = 'Saved';
                 const themeStored = !themeChanged || localWrite(themeStorageKey, themeDraft);
                 if (themeStored) savedThemeChoice = themeDraft;
                 applyAppearance(savedAppearance);
                 applyTheme(savedThemeChoice);
                 setAppearanceBusy(false);
                 closeAppearance(true);
-                setGlobalStatus(themeStored ? 'Appearance saved in this file' : 'Appearance saved; this browser could not store its theme', themeStored ? '' : 'error');
+                setGlobalStatus(themeStored ? 'Appearance saved' : 'Appearance saved; this browser could not store its theme', themeStored ? '' : 'error');
             } catch (error) {
                 if (error.status === 409 && error.payload.current) {
-                    savedAppearance = {...appearanceDefaults, ...error.payload.current, tokens: {...(error.payload.current.tokens || {})}};
+                    savedAppearance = {...appearanceDefaults, ...error.payload.current};
                     boot.appearance = savedAppearance;
                 }
                 els['appearance-status'].dataset.kind = 'error';
@@ -2990,4 +2892,4 @@ if (!defined('PHPLET_LIBRARY_ONLY')) {
 
 __halt_compiler();
 PIPLET-DATA/1
-{"format":1,"revision":3,"notes":{"welcome":{"id":"welcome","title":"A quieter web","body":"This is a **phplet**: the application and its notes live together in one PHP file.\n\nChoose **Edit note** above and watch your changes appear in the live preview.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[A quieter web|welcome]]` links one note to another\n\nUse **Appearance** in the top bar to make the interface your own.","tags":["welcome","simplicity"],"revision":1,"created":"2026-08-15T05:30:00Z","updated":"2026-08-15T05:30:00Z"}}}
+{"format":1,"revision":7,"notes":{"welcome":{"id":"welcome","title":"Hello, phplet","body":"This is a **phplet**: a single file php application.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[Hello, phplet|welcome]]` links one note to another","tags":["welcome","simplicity"],"revision":7,"created":"2026-08-15T05:30:00Z","updated":"2026-08-17T01:19:34Z"}}}

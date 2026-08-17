@@ -40,8 +40,8 @@ function make_fixture(string $source, string $destination): bool
         'notes' => [
             'welcome' => [
                 'id' => 'welcome',
-                'title' => 'A quieter web',
-                'body' => "This is a **phplet**: the application and its notes live together in one PHP file.\n\nChoose **Edit note** above and watch your changes appear in the live preview.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[A quieter web|welcome]]` links one note to another\n\nUse **Appearance** in the top bar to make the interface your own.",
+                'title' => 'Hello, phplet',
+                'body' => "This is a **phplet**: a single file php application.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[Hello, phplet|welcome]]` links one note to another",
                 'tags' => ['welcome', 'simplicity'],
                 'revision' => 1,
                 'created' => '2026-08-15T05:30:00Z',
@@ -52,6 +52,13 @@ function make_fixture(string $source, string $destination): bool
     $json = json_encode($document, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     $fixture = substr($raw, 0, $markerAt) . $marker . $json . "\n";
     return file_put_contents($destination, $fixture) === strlen($fixture);
+}
+
+function fixture_copy(string $root, string $source, string $name, string $failure): string
+{
+    $destination = "$root/$name/index.php";
+    check(mkdir(dirname($destination), 0700) && make_fixture($source, $destination), $failure);
+    return $destination;
 }
 
 function css_theme_tokens(string $source, string $selector): array
@@ -359,6 +366,42 @@ function wait_for_server(int $port): void
         usleep(20000);
     }
     throw new RuntimeException('The PHP test server did not start.');
+}
+
+function test_environment(array $set = []): array
+{
+    $environment = getenv();
+    $environment = is_array($environment) ? $environment : [];
+    unset($environment['PHPLET_PASSWORD'], $environment['PHPLET_ALLOW_PASSWORDLESS']);
+    return [...$environment, ...$set];
+}
+
+function start_test_server(string $root, array $environment, string $failure): array
+{
+    $port = free_port();
+    $pipes = [];
+    $process = proc_open(
+        [PHP_BINARY, '-S', "127.0.0.1:$port", '-t', $root],
+        [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']],
+        $pipes,
+        $root,
+        $environment
+    );
+    check(is_resource($process), $failure);
+    fclose($pipes[0]);
+    try {
+        wait_for_server($port);
+    } catch (Throwable $error) {
+        if (terminate_process($process, 1.0)) proc_close($process);
+        throw $error;
+    }
+    return [$process, $port];
+}
+
+function stop_test_server($process, string $name): void
+{
+    if (!terminate_process($process, 1.0)) throw new RuntimeException("The $name test server could not be terminated.");
+    proc_close($process);
 }
 
 function chrome_binary(): ?string
@@ -680,11 +723,9 @@ try {
         'font' => 'editorial',
         'scale' => 'comfortable',
         'measure' => 'balanced',
-        'tokens' => [],
+        'customCss' => '',
     ];
-    $appearanceRoot = $temporaryRoot . '/appearance';
-    check(mkdir($appearanceRoot, 0700) && make_fixture($source, $appearanceRoot . '/index.php'), 'Could not create the appearance fixture.');
-    $appearanceCopy = $appearanceRoot . '/index.php';
+    $appearanceCopy = fixture_copy($temporaryRoot, $source, 'appearance', 'Could not create the appearance fixture.');
     check(worker_command($appearanceCopy, 'current-appearance') === $defaultAppearance, 'A document without appearance settings did not use the defaults.');
     $appearancePrefix = worker_command($appearanceCopy, 'prefix');
     $defaultHash = hash_file('sha256', $appearanceCopy);
@@ -699,7 +740,7 @@ try {
         'font' => 'modern',
         'scale' => 'large',
         'measure' => 'wide',
-        'tokens' => [],
+        'customCss' => ".story { --test-label: 'ocean'; }",
     ];
     $savedAppearance = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $oceanAppearance]);
     $expectedOcean = ['revision' => 2] + $oceanAppearance;
@@ -723,15 +764,13 @@ try {
         'font' => 'typewriter',
         'scale' => 'compact',
         'measure' => 'focused',
-        'tokens' => [],
+        'customCss' => '',
     ];
     $afterUnrelated = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 2, 'appearance' => $plumAppearance]);
     check($afterUnrelated['result'] === ['revision' => 4] + $plumAppearance, 'An unrelated note edit caused an appearance conflict.');
     check(isset($afterUnrelated['document']['notes']['unrelated-note']), 'An appearance save lost an unrelated note edit.');
 
-    $appearanceAbaRoot = $temporaryRoot . '/appearance-aba';
-    check(mkdir($appearanceAbaRoot, 0700) && make_fixture($source, $appearanceAbaRoot . '/index.php'), 'Could not create the appearance revision fixture.');
-    $appearanceAbaCopy = $appearanceAbaRoot . '/index.php';
+    $appearanceAbaCopy = fixture_copy($temporaryRoot, $source, 'appearance-aba', 'Could not create the appearance revision fixture.');
     $firstAppearance = worker_command($appearanceAbaCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $oceanAppearance]);
     $resetAppearance = worker_command($appearanceAbaCopy, 'appearance', ['baseRevision' => $firstAppearance['result']['revision'], 'appearance' => array_diff_key($defaultAppearance, ['revision' => true])]);
     $expectedReset = $defaultAppearance;
@@ -742,32 +781,27 @@ try {
     check($staleAppearance['current'] === $expectedReset, 'A stale appearance save crossed a customize/reset boundary.');
     check(hash_file('sha256', $appearanceAbaCopy) === $resetHash, 'A stale appearance save changed the file.');
 
-    $invalidAppearanceRoot = $temporaryRoot . '/appearance-invalid';
-    check(mkdir($invalidAppearanceRoot, 0700) && make_fixture($source, $invalidAppearanceRoot . '/index.php'), 'Could not create the invalid appearance fixture.');
-    $invalidAppearanceCopy = $invalidAppearanceRoot . '/index.php';
+    $invalidAppearanceCopy = fixture_copy($temporaryRoot, $source, 'appearance-invalid', 'Could not create the invalid appearance fixture.');
     $invalidAppearanceHash = hash_file('sha256', $invalidAppearanceCopy);
     $missingAppearance = $oceanAppearance;
     unset($missingAppearance['measure']);
+    $missingCssAppearance = $oceanAppearance;
+    unset($missingCssAppearance['customCss']);
     $extraAppearance = $oceanAppearance;
     $extraAppearance['css'] = 'body { display: none }';
     $injectedAppearance = $oceanAppearance;
     $injectedAppearance['palette'] = 'quiet"} body { display:none } /*';
-    $unknownTokenAppearance = $oceanAppearance;
-    $unknownTokenAppearance['tokens'] = ['--not-a-token' => '#ffffff'];
-    $invalidTokenAppearance = $oceanAppearance;
-    $invalidTokenAppearance['tokens'] = ['--accent' => 'url(https://example.test)'];
-    $injectedTokenAppearance = $oceanAppearance;
-    $injectedTokenAppearance['tokens'] = ['--radius' => '10px; display:none'];
-    $outOfRangeTokenAppearance = $oceanAppearance;
-    $outOfRangeTokenAppearance['tokens'] = ['--radius' => '25px'];
+    $nonTextCssAppearance = $oceanAppearance;
+    $nonTextCssAppearance['customCss'] = ['body { display: none }'];
+    $oversizeCssAppearance = $oceanAppearance;
+    $oversizeCssAppearance['customCss'] = str_repeat('x', 32 * 1024 + 1);
     foreach ([
         ['baseRevision' => 0, 'appearance' => $missingAppearance],
+        ['baseRevision' => 0, 'appearance' => $missingCssAppearance],
         ['baseRevision' => 0, 'appearance' => $extraAppearance],
         ['baseRevision' => 0, 'appearance' => $injectedAppearance],
-        ['baseRevision' => 0, 'appearance' => $unknownTokenAppearance],
-        ['baseRevision' => 0, 'appearance' => $invalidTokenAppearance],
-        ['baseRevision' => 0, 'appearance' => $injectedTokenAppearance],
-        ['baseRevision' => 0, 'appearance' => $outOfRangeTokenAppearance],
+        ['baseRevision' => 0, 'appearance' => $nonTextCssAppearance],
+        ['baseRevision' => 0, 'appearance' => $oversizeCssAppearance],
         ['baseRevision' => 0, 'appearance' => 'ocean'],
     ] as $invalidAppearance) {
         $failure = finish_worker(start_worker($invalidAppearanceCopy, 'appearance', $invalidAppearance), 2);
@@ -776,27 +810,23 @@ try {
     check(hash_file('sha256', $invalidAppearanceCopy) === $invalidAppearanceHash, 'Invalid appearance input changed the file.');
     check(worker_command($invalidAppearanceCopy, 'current-appearance') === $defaultAppearance, 'Invalid appearance input changed the effective defaults.');
 
-    $legacyAppearanceRoot = $temporaryRoot . '/appearance-legacy';
-    check(mkdir($legacyAppearanceRoot, 0700) && make_fixture($source, $legacyAppearanceRoot . '/index.php'), 'Could not create the legacy appearance fixture.');
-    $legacyAppearanceCopy = $legacyAppearanceRoot . '/index.php';
+    $legacyAppearanceCopy = fixture_copy($temporaryRoot, $source, 'appearance-legacy', 'Could not create the legacy appearance fixture.');
     worker_command($legacyAppearanceCopy, 'inject-appearance', [
         'palette' => 'retired-choice',
         'font' => 'modern',
         'scale' => 'large',
         'futureSetting' => ['kept' => true],
-        'tokens' => ['--accent' => 'url(https://invalid.example)', '--future-token' => '#ffffff'],
+        'tokens' => ['--story-width' => '60rem', '--accent' => 'url(https://invalid.example)', '--future-token' => '#ffffff'],
     ]);
     $legacyEffective = worker_command($legacyAppearanceCopy, 'current-appearance');
-    check($legacyEffective === ['revision' => 2, 'palette' => 'quiet', 'font' => 'modern', 'scale' => 'large', 'measure' => 'balanced', 'tokens' => []], 'A sparse or retired appearance record did not fall back safely.');
+    check($legacyEffective === ['revision' => 2, 'palette' => 'quiet', 'font' => 'modern', 'scale' => 'large', 'measure' => 'balanced', 'customCss' => ":root {\n  --story-width: 60rem;\n}"], 'A sparse appearance record did not migrate its safe legacy CSS.');
     $legacySaved = worker_command($legacyAppearanceCopy, 'appearance', ['baseRevision' => 2, 'appearance' => $plumAppearance]);
     check($legacySaved['result'] === ['revision' => 3] + $plumAppearance, 'A migrated appearance could not be saved.');
     $legacyRaw = worker_command($legacyAppearanceCopy, 'read');
     check(($legacyRaw['appearance']['futureSetting']['kept'] ?? false) === true, 'A future appearance field was erased by a known-setting save.');
     check(($legacyRaw['appearance']['tokens']['--future-token'] ?? null) === '#ffffff', 'A future design token was erased by a known-setting save.');
 
-    $idempotentRoot = $temporaryRoot . '/idempotent-create';
-    check(mkdir($idempotentRoot, 0700) && make_fixture($source, $idempotentRoot . '/index.php'), 'Could not create the idempotent-create fixture.');
-    $idempotentCopy = $idempotentRoot . '/index.php';
+    $idempotentCopy = fixture_copy($temporaryRoot, $source, 'idempotent-create', 'Could not create the idempotent-create fixture.');
     $createPayload = [
         'id' => null, 'baseRevision' => 0, 'createToken' => str_repeat('a', 32),
         'title' => 'Only once', 'body' => 'A retry is the same mutation.', 'tags' => ['retry'],
@@ -825,9 +855,7 @@ try {
     ]), 2);
     check(str_contains($badCreateToken['stderr'], 'Invalid note creation token'), 'An invalid creation token was accepted.');
 
-    $sameTokenRoot = $temporaryRoot . '/same-token-race';
-    check(mkdir($sameTokenRoot, 0700) && make_fixture($source, $sameTokenRoot . '/index.php'), 'Could not create the same-token concurrency fixture.');
-    $sameTokenCopy = $sameTokenRoot . '/index.php';
+    $sameTokenCopy = fixture_copy($temporaryRoot, $source, 'same-token-race', 'Could not create the same-token concurrency fixture.');
     $sameTokenPayload = [
         'id' => null, 'baseRevision' => 0, 'createToken' => str_repeat('c', 32),
         'title' => 'Concurrent retry', 'body' => 'one logical create', 'tags' => [],
@@ -842,15 +870,13 @@ try {
     check(str_contains($duplicateTokenFailure['stderr'], 'Invalid note creation token'), 'Duplicate stored creation tokens passed document validation.');
     check(hash_file('sha256', $sameTokenCopy) === $duplicateTokenHash, 'Duplicate-token rejection changed the canonical file.');
 
-    $abaRoot = $temporaryRoot . '/aba';
-    check(mkdir($abaRoot, 0700) && make_fixture($source, $abaRoot . '/index.php'), 'Could not create the revision fixture.');
-    $abaCopy = $abaRoot . '/index.php';
+    $abaCopy = fixture_copy($temporaryRoot, $source, 'aba', 'Could not create the revision fixture.');
     $firstWelcomeEdit = worker_command($abaCopy, 'save', [
-        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'A quieter web', 'body' => 'first editor', 'tags' => [],
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, phplet', 'body' => 'first editor', 'tags' => [],
     ]);
     check($firstWelcomeEdit['result']['revision'] === 2, 'The first bundled-note edit did not advance its revision.');
     $staleWelcome = worker_conflict($abaCopy, 'save', [
-        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'A quieter web', 'body' => 'stale editor', 'tags' => [],
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, phplet', 'body' => 'stale editor', 'tags' => [],
     ]);
     check($staleWelcome['current']['body'] === 'first editor', 'A stale bundled-note editor was not rejected.');
     worker_command($abaCopy, 'delete', ['id' => 'welcome', 'baseRevision' => 2]);
@@ -921,10 +947,8 @@ try {
     // Deterministically exercise the stale-inode retry. Instrument only this
     // disposable copy: A opens inode 1 and pauses; B replaces it with inode 2;
     // A resumes, rejects its stale descriptor, retries, and preserves B's save.
-    $raceRoot = $temporaryRoot . '/race';
-    check(mkdir($raceRoot, 0700), 'Could not create the stale-inode fixture.');
-    $raceCopy = $raceRoot . '/index.php';
-    check(make_fixture($source, $raceCopy), 'Could not create the stale-inode copy.');
+    $raceCopy = fixture_copy($temporaryRoot, $source, 'race', 'Could not create the stale-inode fixture.');
+    $raceRoot = dirname($raceCopy);
     $raceSource = file_get_contents($raceCopy);
     $needle = <<<'PHP'
         if ($handle === false) {
@@ -975,9 +999,8 @@ PHP;
     check(isset($raceDocument['notes']['opened-before-rename']), 'The retried mutation was lost.');
     check($raceDocument['revision'] === 3, 'The deterministic race lost a document revision.');
 
-    $faultRoot = $temporaryRoot . '/fault';
-    check(mkdir($faultRoot, 0700) && make_fixture($source, $faultRoot . '/index.php'), 'Could not create the fault-injection fixture.');
-    $faultCopy = $faultRoot . '/index.php';
+    $faultCopy = fixture_copy($temporaryRoot, $source, 'fault', 'Could not create the fault-injection fixture.');
+    $faultRoot = dirname($faultCopy);
     $faultSource = file_get_contents($faultCopy);
     $faultNeedle = <<<'PHP'
         $tempHandle = null;
@@ -1004,9 +1027,7 @@ PHP;
     check(hash_file('sha256', $faultCopy) === $faultHash, 'A failed pre-rename commit changed the canonical file.');
     check(glob($faultRoot . '/.phplet-tmp-*.php') === [], 'A failed pre-rename commit left its temporary snapshot.');
 
-    $modeRoot = $temporaryRoot . '/mode';
-    check(mkdir($modeRoot, 0700) && make_fixture($source, $modeRoot . '/index.php'), 'Could not create the mode fixture.');
-    $modeCopy = $modeRoot . '/index.php';
+    $modeCopy = fixture_copy($temporaryRoot, $source, 'mode', 'Could not create the mode fixture.');
     check(chmod($modeCopy, 0440), 'Could not set the mode fixture permissions.');
     clearstatcache(true, $modeCopy);
     $readOnlyInode = fileinode($modeCopy);
@@ -1015,18 +1036,16 @@ PHP;
     check(fileinode($modeCopy) !== $readOnlyInode && worker_command($modeCopy, 'summary')['notes'] === 2, 'A readable file in a writable directory could not be atomically replaced.');
     check((fileperms($modeCopy) & 0777) === 0440, 'Atomic replacement did not preserve read-only mode bits.');
 
-    $hardRoot = $temporaryRoot . '/hardlink';
-    check(mkdir($hardRoot, 0700) && make_fixture($source, $hardRoot . '/index.php'), 'Could not create the hard-link fixture.');
-    $hardCopy = $hardRoot . '/index.php';
+    $hardCopy = fixture_copy($temporaryRoot, $source, 'hardlink', 'Could not create the hard-link fixture.');
+    $hardRoot = dirname($hardCopy);
     check(link($hardCopy, $hardRoot . '/alias.php'), 'Could not create a hard-linked alias.');
     $hardHash = hash_file('sha256', $hardCopy);
     $hardFailure = finish_worker(start_worker($hardCopy, 'save', ['id' => null, 'baseRevision' => 0, 'title' => 'Must fail', 'body' => '', 'tags' => []]), 2);
     check(str_contains($hardFailure['stderr'], 'Hard-linked phplets'), 'A hard-linked deployment was not rejected clearly.');
     check(hash_file('sha256', $hardCopy) === $hardHash, 'Hard-link rejection changed the canonical file.');
 
-    $largeRoot = $temporaryRoot . '/large';
-    check(mkdir($largeRoot, 0700) && make_fixture($source, $largeRoot . '/index.php'), 'Could not create the large-data fixture.');
-    $largeCopy = $largeRoot . '/index.php';
+    $largeCopy = fixture_copy($temporaryRoot, $source, 'large', 'Could not create the large-data fixture.');
+    $largeRoot = dirname($largeCopy);
     $largeStart = microtime(true);
     $largePeak = 0;
     $largeNotes = [];
@@ -1055,15 +1074,13 @@ PHP;
     check($savedLint['status'] === 0, 'The saved phplet no longer lints.');
 
     // Exercise the actual HTML and JSON API against another isolated copy.
-    $httpRoot = $temporaryRoot . '/http';
-    check(mkdir($httpRoot, 0700), 'Could not create the HTTP fixture.');
-    $httpCopy = $httpRoot . '/index.php';
-    check(make_fixture($source, $httpCopy), 'Could not create the HTTP copy.');
+    $httpCopy = fixture_copy($temporaryRoot, $source, 'http', 'Could not create the HTTP fixture.');
+    $httpRoot = dirname($httpCopy);
     $browserHarness = <<<'PHP'
     <script nonce="<?= phplet_h($nonce) ?>">
     (() => {
         const browserMode = new URLSearchParams(location.search).get('__browser');
-        if (!['state', 'mobile'].includes(browserMode)) return;
+        if (!['state', 'mobile', 'safe'].includes(browserMode)) return;
         const runtimeErrors = [];
         addEventListener('error', event => runtimeErrors.push(event.message || 'window error'));
         addEventListener('unhandledrejection', event => runtimeErrors.push(String(event.reason?.message || event.reason || 'unhandled rejection')));
@@ -1093,6 +1110,38 @@ PHP;
         };
         const nativeFetch = window.fetch.bind(window);
         const progress = label => nativeFetch(`?__browser_progress=${encodeURIComponent(`${browserMode}:${label}`)}`).catch(() => null);
+        if (browserMode === 'safe') {
+            const runSafe = async () => {
+                const state = JSON.parse(document.getElementById('phplet-state').textContent);
+                assert(state.safeAppearance && state.appearance.customCss, 'safe mode lost the stored custom CSS');
+                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode applied stored custom CSS');
+                assert(document.querySelector('.safe-appearance'), 'safe mode did not explain how to recover');
+                document.getElementById('appearance-button').click();
+                await until(() => document.getElementById('appearance-dialog').open, 'appearance did not open in safe mode');
+                const editor = document.getElementById('appearance-css');
+                assert(editor.value === state.appearance.customCss, 'safe mode did not keep custom CSS editable');
+                input(editor, '* { display: none !important; }');
+                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode live-previewed custom CSS');
+                input(editor, '');
+                document.getElementById('appearance-form').requestSubmit();
+                await until(() => !document.getElementById('appearance-dialog').open, 'safe mode could not clear custom CSS');
+                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode applied CSS while clearing it');
+                const snapshot = await nativeFetch('?download=1').then(response => response.text());
+                const marker = '\nPIPLET-DATA/1\n';
+                const documentState = JSON.parse(snapshot.slice(snapshot.lastIndexOf(marker) + marker.length).trim());
+                assert(documentState.appearance.customCss === '', 'safe mode did not persist the cleared CSS');
+                if (runtimeErrors.length) throw new Error(`safe-mode page error: ${runtimeErrors.join('; ')}`);
+            };
+            runSafe().then(async () => {
+                result.textContent = 'PASS'; document.body.append(result);
+                await progress('result:PASS');
+            }).catch(async error => {
+                const message = String(error.stack || error.message).replace(/\s+/g, ' ');
+                result.textContent = `FAIL: ${message}`; document.body.append(result);
+                await progress(`result:FAIL: ${message}`);
+            });
+            return;
+        }
         if (browserMode === 'mobile') {
             const runMobile = async () => {
                 assert(matchMedia('(max-width: 760px)').matches && innerWidth <= 760,
@@ -1162,6 +1211,10 @@ PHP;
                 return [...document.querySelectorAll('.library-item')].find(node => node.querySelector('.library-title')?.textContent === title);
             };
             await progress(`start:${sessionStorage.getItem('phplet-browser-phase') || 'main'}`);
+            assert(document.getElementById('global-status').textContent === ''
+                && document.getElementById('global-status').getAttribute('role') === 'status',
+                'the header started with stale status copy or lost its live-region semantics');
+            assert(!document.getElementById('file-size'), 'the idle header displayed file metadata');
             if (sessionStorage.getItem('phplet-browser-phase') === 'read-only') {
                 await until(() => document.querySelector('.plain-note[aria-label="Recovered draft text"]'), 'read-only page did not expose its browser draft');
                 const expectedRecoveries = new Map([
@@ -1346,7 +1399,7 @@ PHP;
                 await until(() => !document.querySelector('.editor'), 'dangling-link owner did not close after choosing the saved version');
                 assert(!sessionStorage.getItem(danglingOwnerKey), 'dangling-link owner recovery was not cleared');
 
-                const welcomeItem = await findLibraryItem('A quieter web');
+                const welcomeItem = await findLibraryItem('Hello, phplet');
                 assert(welcomeItem, 'welcome note was missing before story-cap recovery');
                 welcomeItem.click();
                 click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'story-cap welcome edit');
@@ -1423,6 +1476,7 @@ PHP;
             assert(hostileItem, 'hostile-content note was missing from the browser fixture');
             hostileItem.click();
             const hostileNote = document.getElementById('phplet-note-http-note');
+            assert(!document.getElementById('css-pwn') && !document.body.dataset.pwned, 'stored custom CSS became executable markup');
             assert(hostileNote?.querySelector('.prose h3')?.textContent === 'Safe heading', 'note headings did not preserve the document outline');
             assert(hostileNote?.querySelector('.prose h4')?.textContent === 'Subheading' && hostileNote?.querySelector('.prose h5')?.textContent === 'Detail', 'nested note headings lost their semantic levels');
             const headingSizes = ['h3', 'h4', 'h5'].map(selector => parseFloat(getComputedStyle(hostileNote.querySelector(selector)).fontSize));
@@ -1486,19 +1540,18 @@ PHP;
             document.getElementById('appearance-button').click();
             await until(() => appearanceDialog.open, 'appearance did not reopen');
             document.querySelector('.appearance-custom').open = true;
-            const tokenEditor = document.getElementById('appearance-tokens');
-            input(tokenEditor, '--radius: 10px; display:none;');
-            assert(document.getElementById('appearance-status').dataset.kind === 'error', 'invalid token syntax was not rejected in preview');
-            assert(!document.getElementById('phplet-token-style').textContent.includes('display:none'), 'invalid token syntax reached the stylesheet');
+            const cssEditor = document.getElementById('appearance-css');
+            input(cssEditor, 'x'.repeat(32 * 1024 + 1));
+            assert(document.getElementById('appearance-status').dataset.kind === 'error', 'oversized custom CSS was not rejected in preview');
             const plum = document.querySelector('input[name="appearance-palette"][value="plum"]');
             plum.checked = true;
             plum.dispatchEvent(new Event('input', {bubbles: true}));
-            assert(document.documentElement.dataset.palette === 'plum', 'an invalid token blocked an unrelated palette preview');
-            input(tokenEditor, '--story-width: 60rem;\n--radius: 10px;');
-            assert(document.getElementById('phplet-token-style').textContent.includes('--story-width:60rem;'), 'design-token preview was not applied');
-            assert(getComputedStyle(document.documentElement).getPropertyValue('--story-width').trim() === '60rem', 'the design-token layer lost computed precedence');
+            input(cssEditor, ':root { --story-width: 60rem; }\n.note-title { letter-spacing: 0; }\n</sty' + 'le><script id="css-pwn">1</scr' + 'ipt>');
+            assert(document.getElementById('phplet-custom-style').textContent === cssEditor.value, 'custom CSS preview was not applied as text');
+            assert(!document.getElementById('css-pwn'), 'custom CSS escaped its style element');
+            assert(getComputedStyle(document.documentElement).getPropertyValue('--story-width').trim() === '60rem', 'custom CSS lost cascade precedence');
             document.getElementById('appearance-form').requestSubmit();
-            await until(() => !appearanceDialog.open, 'design-token save did not finish');
+            await until(() => !appearanceDialog.open, 'custom CSS save did not finish');
 
             let saveCalls = 0;
             let releaseSave = null;
@@ -1528,11 +1581,24 @@ PHP;
             assert(document.getElementById('edit-body').disabled, 'editor remained writable during save');
             document.getElementById('new-button').click();
             assert(document.getElementById('edit-title').value === 'One browser save', 'navigation replaced the in-flight editor');
+            const nativeStatusTimeout = window.setTimeout;
+            let savedStatusExpiry = null;
+            window.setTimeout = function (callback, delay, ...args) {
+                if (delay === 4000) {
+                    savedStatusExpiry = () => callback(...args);
+                    return 2147483646;
+                }
+                return nativeStatusTimeout.call(this, callback, delay, ...args);
+            };
             releaseSave();
             await until(() => [...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save'), 'saved note did not render');
+            window.setTimeout = nativeStatusTimeout;
             assert(saveCalls === 1, 'one user save created multiple requests');
-            assert(document.getElementById('file-size').isConnected && document.getElementById('file-size').textContent === 'Saved',
-                'the save confirmation was missing or used implementation jargon');
+            const savedStatus = document.getElementById('global-status').textContent;
+            assert(/saved/i.test(savedStatus) && savedStatus.includes('One browser save'), 'the save notice did not identify its note');
+            assert(savedStatusExpiry, 'the save notice did not schedule its expiry');
+            savedStatusExpiry();
+            assert(document.getElementById('global-status').textContent === '', 'the expired save notice left stale header context');
             window.fetch = nativeFetch;
 
             document.getElementById('new-button').click();
@@ -1543,7 +1609,11 @@ PHP;
             await until(() => document.getElementById('phplet-note-new') && !document.querySelector('.editor'), 'a note whose slug is new did not save');
             assert(document.querySelectorAll('#phplet-note-new').length === 1 && document.querySelectorAll('#note-count').length === 1,
                 'a saved note collided with a fixed page element ID');
+            assert(/saved/i.test(document.getElementById('global-status').textContent)
+                && document.getElementById('global-status').textContent.includes('new'),
+                'the new-slug save notice was not contextual');
             click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit the real new-slug note');
+            assert(document.getElementById('global-status').textContent === '', 'clicking into a note left the prior save notice visible');
             await until(() => document.querySelector('#phplet-note-new.editor'), 'the real new-slug editor did not open');
             input(document.getElementById('edit-body'), 'unsaved body for the real new slug');
             document.getElementById('new-button').click();
@@ -1667,6 +1737,45 @@ PHP;
             assert(document.querySelectorAll('#note-count').length === 1
                 && document.getElementById('note-count').classList.contains('note-count'),
                 'a note slug collided with the fixed note-count element');
+            click(document.querySelector('#phplet-note-count button[title="Edit note"]'), 'edit the disposable count note');
+            await until(() => document.querySelector('#phplet-note-count.editor'), 'the disposable count editor did not open');
+            button(document.querySelector('.editor-actions'), 'Delete').click();
+            await until(() => document.querySelector('#phplet-note-count .delete-row'), 'the disposable count delete confirmation did not open');
+            const nativeDeleteTimeout = window.setTimeout;
+            let deleteStatusExpiry = null;
+            window.setTimeout = function (callback, delay, ...args) {
+                if (delay === 4000) {
+                    deleteStatusExpiry = () => callback(...args);
+                    return 2147483645;
+                }
+                return nativeDeleteTimeout.call(this, callback, delay, ...args);
+            };
+            let releaseDelete = null;
+            window.fetch = (resource, options) => {
+                if (String(resource).includes('api=delete')) {
+                    return new Promise((resolve, reject) => {
+                        releaseDelete = () => nativeFetch(resource, options).then(resolve, reject);
+                    });
+                }
+                return nativeFetch(resource, options);
+            };
+            button(document.querySelector('#phplet-note-count .delete-row'), 'Delete note').click();
+            await until(() => releaseDelete !== null, 'the disposable delete was not held');
+            const deletingStatus = document.getElementById('global-status').textContent;
+            assert(/deleting/i.test(deletingStatus) && deletingStatus.includes('count'), 'the pending delete did not identify its note');
+            document.body.click();
+            document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Tab', bubbles: true}));
+            assert(document.getElementById('global-status').textContent === deletingStatus,
+                'ordinary interaction cleared a pending operation status');
+            releaseDelete();
+            await until(() => !document.getElementById('phplet-note-count'), 'the disposable count note was not deleted');
+            window.fetch = nativeFetch;
+            window.setTimeout = nativeDeleteTimeout;
+            const deletedStatus = document.getElementById('global-status').textContent;
+            assert(/deleted/i.test(deletedStatus) && deletedStatus.includes('count'), 'the delete notice did not identify its note');
+            assert(deleteStatusExpiry, 'the delete notice did not schedule its expiry');
+            deleteStatusExpiry();
+            assert(document.getElementById('global-status').textContent === '', 'the expired delete notice left stale header context');
 
             let loseCreateResponse = true;
             window.fetch = (resource, options) => {
@@ -1695,15 +1804,27 @@ PHP;
                 id: lostCurrent.id, baseRevision: lostCurrent.revision,
                 title: 'Independent destination draft', body: 'do not overwrite this draft', tags: ['independent']
             }));
+            const occupiedCreateSetItem = Storage.prototype.setItem;
+            Storage.prototype.setItem = function (key, value) {
+                if (key === oldCreateKey) throw new DOMException('blocked', 'QuotaExceededError');
+                return occupiedCreateSetItem.call(this, key, value);
+            };
+            input(document.getElementById('edit-body'), 'latest text while recovery storage fails');
+            document.querySelector('.editor form').requestSubmit();
+            await until(() => document.querySelector('.save-status')?.textContent.includes('other recovery was not opened'),
+                'create-conflict switch did not report its failed source recovery');
+            assert(document.getElementById('edit-body')?.value === 'latest text while recovery storage fails',
+                'create-conflict switch hid live text after source recovery failed');
+            Storage.prototype.setItem = occupiedCreateSetItem;
             document.querySelector('.editor form').requestSubmit();
             await until(() => document.getElementById('edit-title')?.value === 'Independent destination draft',
                 'create-conflict migration did not open its occupied destination first');
-            assert(JSON.parse(sessionStorage.getItem(oldCreateKey))?.body === 'changed after lost response',
+            assert(JSON.parse(sessionStorage.getItem(oldCreateKey))?.body === 'latest text while recovery storage fails',
                 'create-conflict migration overwrote the source composer');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'occupied create destination did not resolve');
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('edit-body')?.value === 'changed after lost response',
+            await until(() => document.getElementById('edit-body')?.value === 'latest text while recovery storage fails',
                 'the preserved lost-response composer did not reopen');
             const createConflictSetItem = Storage.prototype.setItem;
             Storage.prototype.setItem = function (key, value) {
@@ -1712,7 +1833,7 @@ PHP;
             };
             document.querySelector('.editor form').requestSubmit();
             await until(() => document.querySelector('.conflict-panel'), 'changed lost-response retry did not show its conflict');
-            assert(document.querySelector('.editor') && document.getElementById('edit-body').value === 'changed after lost response', 'create conflict disappeared or lost its draft');
+            assert(document.querySelector('.editor') && document.getElementById('edit-body').value === 'latest text while recovery storage fails', 'create conflict disappeared or lost its draft');
             assert(document.querySelector('.save-status').textContent.includes('could not store'), 'create conflict storage failure was mislabeled as recovered');
             await until(() => document.querySelector('.conflict-panel')?.contains(document.activeElement), 'create conflict did not receive keyboard focus');
             Storage.prototype.setItem = createConflictSetItem;
@@ -1782,14 +1903,14 @@ PHP;
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'fresh editor did not cancel');
 
-            const welcomeForConflict = await findLibraryItem('A quieter web');
+            const welcomeForConflict = await findLibraryItem('Hello, phplet');
             assert(welcomeForConflict, 'welcome was missing from the conflict library');
             welcomeForConflict.click();
             await until(() => document.getElementById('phplet-note-welcome'), 'welcome did not open for conflict testing');
             click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'conflict welcome edit');
             await until(() => document.querySelector('#phplet-note-welcome.editor'), 'welcome editor did not open');
             input(document.getElementById('edit-body'), 'my conflicted draft');
-            const remote = await api('save', {id: 'welcome', baseRevision: 1, title: 'A quieter web', body: 'saved in another tab', tags: ['welcome']});
+            const remote = await api('save', {id: 'welcome', baseRevision: 1, title: 'Hello, phplet', body: 'saved in another tab', tags: ['welcome']});
             assert(remote.ok, 'competing save failed');
             const conflictSetItem = Storage.prototype.setItem;
             Storage.prototype.setItem = function (key, value) {
@@ -1913,17 +2034,29 @@ PHP;
             const deletedSourceKey = `${independentComposerKey.slice(0, -4)}${deletedConflictNote.id}`;
             assert(JSON.parse(sessionStorage.getItem(deletedSourceKey))?.body === 'keep after remote deletion',
                 'deleted-note conflict did not remain recoverable at its source key');
+            const deletedConflictSetItem = Storage.prototype.setItem;
+            Storage.prototype.setItem = function (key, value) {
+                if (key === deletedSourceKey) throw new DOMException('blocked', 'QuotaExceededError');
+                return deletedConflictSetItem.call(this, key, value);
+            };
+            input(document.getElementById('edit-body'), 'latest deleted-note text while storage fails');
+            button(document.querySelector('.conflict-panel'), 'Save as new').click();
+            await until(() => document.querySelector('.save-status')?.textContent.includes('other recovery was not opened'),
+                'deleted-note switch did not report its failed source recovery');
+            assert(document.getElementById('edit-body')?.value === 'latest deleted-note text while storage fails',
+                'deleted-note switch hid live text after source recovery failed');
+            Storage.prototype.setItem = deletedConflictSetItem;
             button(document.querySelector('.conflict-panel'), 'Save as new').click();
             await until(() => document.getElementById('edit-body')?.value === 'keep this independent composer',
                 'deleted-note conversion did not open the occupied composer first');
-            assert(JSON.parse(sessionStorage.getItem(deletedSourceKey))?.body === 'keep after remote deletion',
+            assert(JSON.parse(sessionStorage.getItem(deletedSourceKey))?.body === 'latest deleted-note text while storage fails',
                 'opening the occupied composer erased the deleted-note draft');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'independent composer did not resolve before deleted-note recovery');
             document.getElementById('new-button').click();
             await until(() => document.querySelector('.conflict-panel')?.textContent.includes('deleted elsewhere'),
                 'deleted-note source draft did not reopen after the composer resolved');
-            assert(document.getElementById('edit-body').value === 'keep after remote deletion', 'deleted-note source draft lost its text');
+            assert(document.getElementById('edit-body').value === 'latest deleted-note text while storage fails', 'deleted-note source draft lost its text');
             button(document.querySelector('.conflict-panel'), 'Discard draft').click();
             await until(() => !document.querySelector('.editor'), 'deleted-note conflict did not discard');
 
@@ -1965,19 +2098,16 @@ PHP;
     check(file_put_contents($httpCopy, str_replace($browserNeedle, "    </script>\n$browserHarness</body>", $httpSource)) !== false, 'Could not instrument the browser fixture.');
     $browserSignal = $httpRoot . '/browser-progress.log';
     check(file_put_contents($browserSignal, '') === 0, 'Could not initialize the browser completion signal.');
-    $port = free_port();
-    $httpEnvironment = getenv();
-    $httpEnvironment = is_array($httpEnvironment) ? $httpEnvironment : [];
-    unset($httpEnvironment['PHPLET_PASSWORD']);
-    $httpEnvironment['PHPLET_ALLOW_PASSWORDLESS'] = '1';
-    $serverPipes = [];
-    $server = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", '-t', $httpRoot], [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']], $serverPipes, $httpRoot, $httpEnvironment);
-    check(is_resource($server), 'Could not start the PHP test server.');
-    fclose($serverPipes[0]);
+    [$server, $port] = start_test_server(
+        $httpRoot,
+        test_environment(['PHPLET_ALLOW_PASSWORDLESS' => '1']),
+        'Could not start the PHP test server.'
+    );
     try {
-        wait_for_server($port);
         [$getStatus, $getHeaders, $page] = http_request("http://127.0.0.1:$port/");
         check($getStatus === 200, 'The app page did not return 200.');
+        check(!str_contains($page, '>one file<') && !str_contains($page, '> · </span>') && !str_contains($page, 'id="file-size"'),
+            'The header retained its old one-file status, separator, or file size.');
         $csp = (string) header_value($getHeaders, 'Content-Security-Policy');
         check(
             str_contains($csp, "default-src 'none'")
@@ -1996,13 +2126,15 @@ PHP;
         check($setCookie !== null && preg_match('/^([^=]+)=([^;]+)/', $setCookie, $cookieMatch) === 1, 'The CSRF cookie is missing.');
         $token = $tokenMatch[1];
         $cookie = $cookieMatch[1] . '=' . $cookieMatch[2];
+        $authorizedJsonHeaders = ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"];
         $payload = json_encode(['id' => null, 'baseRevision' => 0, 'createToken' => str_repeat('d', 32), 'title' => 'HTTP note', 'body' => "# Safe heading\n\n## Subheading\n\n### Detail\n\n<img src=x onerror=alert(1)>", 'tags' => ['web']], JSON_THROW_ON_ERROR);
+        $hostileCss = ":root { --story-width: 60rem; --radius: 10px; }\n.note-title { letter-spacing: 0; }\n</style><script id=\"css-pwn\">document.body.dataset.pwned=1</script>";
         $httpAppearanceValues = [
             'palette' => 'ocean',
             'font' => 'modern',
             'scale' => 'large',
             'measure' => 'wide',
-            'tokens' => ['--story-width' => '60rem', '--radius' => '10px'],
+            'customCss' => $hostileCss,
         ];
         $appearancePayload = json_encode(['baseRevision' => 0, 'appearance' => $httpAppearanceValues], JSON_THROW_ON_ERROR);
 
@@ -2023,44 +2155,54 @@ PHP;
 
         [$typeStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: text/plain', "X-CSRF-Token: $token"], '{}');
         check($typeStatus === 415, 'The API accepted a non-JSON content type.');
-        [$malformedStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], '{');
+        [$malformedStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, '{');
         check($malformedStatus === 400, 'The API accepted malformed JSON.');
-        [$listRootStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], '[]');
+        [$listRootStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, '[]');
         check($listRootStatus === 400, 'The API accepted a top-level JSON list as an object.');
         $objectTags = json_encode(['id' => null, 'baseRevision' => 0, 'title' => 'Bad tags', 'body' => '', 'tags' => ['name' => 'not-a-list']], JSON_THROW_ON_ERROR);
-        [$tagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $objectTags);
+        [$tagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $objectTags);
         check($tagStatus === 422, 'The API accepted associative tags.');
         $numericObjectTags = '{"id":null,"baseRevision":0,"title":"Bad numeric tags","body":"","tags":{"0":"not-a-list"}}';
-        [$numericTagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $numericObjectTags);
+        [$numericTagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $numericObjectTags);
         check($numericTagStatus === 422, 'The API confused a numeric-key JSON object with a tag list.');
 
-        [$appearanceStatus, , $appearanceBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $appearancePayload);
+        [$appearanceStatus, , $appearanceBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', $authorizedJsonHeaders, $appearancePayload);
         $appearanceResponse = json_decode($appearanceBody, true, 16, JSON_THROW_ON_ERROR);
         $expectedHttpAppearance = ['revision' => 2] + $httpAppearanceValues;
-        check($appearanceStatus === 200 && $appearanceResponse['result'] === $expectedHttpAppearance && $appearanceResponse['documentRevision'] === 2, 'A valid HTTP appearance save failed.');
+        check($appearanceStatus === 200 && $appearanceResponse['result'] === $expectedHttpAppearance
+            && $appearanceResponse['documentRevision'] === 2, 'A valid HTTP appearance save failed.');
 
         [$appearanceGetStatus, , $appearancePage] = http_request("http://127.0.0.1:$port/", 'GET', ["Cookie: $cookie"]);
         check($appearanceGetStatus === 200, 'The app failed after an HTTP appearance save.');
         check(preg_match('/<html\b[^>]*>/i', $appearancePage, $appearanceHtmlMatch) === 1, 'The saved page is missing its html element.');
         $appearanceHtml = $appearanceHtmlMatch[0];
-        foreach (array_diff_key($httpAppearanceValues, ['tokens' => true]) as $name => $value) {
+        foreach (array_diff_key($httpAppearanceValues, ['customCss' => true]) as $name => $value) {
             check(str_contains($appearanceHtml, 'data-' . $name . '="' . $value . '"'), "The saved $name appearance was not rendered on reload.");
         }
-        check(str_contains($appearancePage, '--story-width:60rem;') && str_contains($appearancePage, '--radius:10px;'), 'Saved design tokens were not rendered in the override module.');
+        check(str_contains($appearancePage, '<style nonce=') && str_contains($appearancePage, 'id="phplet-custom-style"></style>'), 'The custom CSS module is not structurally empty.');
+        check(!str_contains($appearancePage, '</style><script id="css-pwn">'), 'Custom CSS was interpolated into live HTML.');
+        check(preg_match('/<script type="application\/json" id="phplet-state"[^>]*>(.*?)<\/script>/s', $appearancePage, $stateMatch) === 1, 'The appearance state block is missing.');
+        $appearanceState = json_decode($stateMatch[1], true, 32, JSON_THROW_ON_ERROR);
+        check($appearanceState['appearance']['customCss'] === $hostileCss && $appearanceState['safeAppearance'] === false, 'Custom CSS did not round-trip through the inert state block.');
+        [$safeStatus, , $safePage] = http_request("http://127.0.0.1:$port/?safe=1", 'GET', ["Cookie: $cookie"]);
+        check($safeStatus === 200 && str_contains($safePage, 'Custom CSS is off for this page.'), 'Safe appearance mode is unavailable.');
+        check(preg_match('/<script type="application\/json" id="phplet-state"[^>]*>(.*?)<\/script>/s', $safePage, $safeStateMatch) === 1, 'Safe mode lost the appearance state block.');
+        $safeState = json_decode($safeStateMatch[1], true, 32, JSON_THROW_ON_ERROR);
+        check($safeState['safeAppearance'] === true && $safeState['appearance']['customCss'] === $hostileCss, 'Safe mode erased the editable CSS instead of only disabling it.');
         $appearanceHash = hash_file('sha256', $httpCopy);
-        [$appearanceStaleStatus, , $appearanceStaleBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $appearancePayload);
+        [$appearanceStaleStatus, , $appearanceStaleBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', $authorizedJsonHeaders, $appearancePayload);
         $appearanceStaleResponse = json_decode($appearanceStaleBody, true, 16, JSON_THROW_ON_ERROR);
         check($appearanceStaleStatus === 409 && $appearanceStaleResponse['current'] === $expectedHttpAppearance, 'The appearance API did not return the current record for a stale save.');
         check(hash_file('sha256', $httpCopy) === $appearanceHash, 'A stale HTTP appearance save changed the file.');
 
-        [$postStatus, , $postBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $payload);
+        [$postStatus, , $postBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $payload);
         check($postStatus === 200, 'A valid HTTP save failed.');
         $post = json_decode($postBody, true, 16, JSON_THROW_ON_ERROR);
         check($post['result']['title'] === 'HTTP note', 'The HTTP response returned the wrong note.');
         $postHash = hash_file('sha256', $httpCopy);
         clearstatcache(true, $httpCopy);
         $postInode = fileinode($httpCopy);
-        [$repeatStatus, , $repeatBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $payload);
+        [$repeatStatus, , $repeatBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $payload);
         $repeat = json_decode($repeatBody, true, 16, JSON_THROW_ON_ERROR);
         clearstatcache(true, $httpCopy);
         check($repeatStatus === 200 && $repeat['result']['id'] === $post['result']['id'], 'A lost-response create retry produced another HTTP note.');
@@ -2103,6 +2245,21 @@ PHP;
             }
             $browserProgress = @file_get_contents($httpRoot . '/browser-progress.log') ?: 'no progress';
             check($browserResult === 'PASS', "Browser regression failed: $browserResult\nProgress:\n$browserProgress");
+            $safeAppearance = worker_command($httpCopy, 'current-appearance');
+            $safeAppearanceValues = array_diff_key($safeAppearance, ['revision' => true]);
+            $safeAppearanceValues['customCss'] = 'html { display: none !important; }';
+            worker_command($httpCopy, 'appearance', ['baseRevision' => $safeAppearance['revision'], 'appearance' => $safeAppearanceValues]);
+            check(file_put_contents($browserSignal, '') === 0, 'Could not reset the safe-mode browser completion signal.');
+            $safeResult = run_browser_scenario(
+                $chrome,
+                "http://127.0.0.1:$port/?safe=1&__browser=safe",
+                $temporaryRoot . '/chrome-safe-profile',
+                $browserSignal,
+                'safe'
+            );
+            $safeProgress = @file_get_contents($httpRoot . '/browser-progress.log') ?: 'no progress';
+            check($safeResult === 'PASS', "Safe-mode browser regression failed: $safeResult\nProgress:\n$safeProgress");
+            check(worker_command($httpCopy, 'current-appearance')['customCss'] === '', 'Safe mode did not clear the broken stylesheet.');
             check(file_put_contents($browserSignal, '') === 0, 'Could not reset the mobile browser completion signal.');
             try {
                 $mobileResult = run_browser_scenario(
@@ -2127,58 +2284,42 @@ PHP;
             check(str_contains($httpSource, "id === null ? '@new' : id") && str_contains($httpSource, "draft.id !== null && draft.id !== 'new'"), 'The null-ID draft namespace or legacy migration guard is missing.');
             check(str_contains($httpSource, 'article.id = editor.id === null ? \'phplet-composer\' : `phplet-note-${editor.id}`;'), 'Saved notes and the composer no longer have separate DOM namespaces.');
             check(str_contains($httpSource, "els['drawer-shade'].tabIndex = -1;") && !str_contains($httpSource, ", els['drawer-shade']];"), 'The modal drawer focus guard includes its outside backdrop.');
+            check(str_contains($httpSource, "boot.safeAppearance ? '' : values.customCss"), 'The safe-mode custom CSS guard is missing.');
             fwrite(STDOUT, "skip — Chrome unavailable; dynamic browser regressions were not run\n");
         }
 
         $deletePayload = json_encode(['id' => $post['result']['id'], 'baseRevision' => $post['result']['revision']], JSON_THROW_ON_ERROR);
-        [$deleteStatus] = http_request("http://127.0.0.1:$port/?api=delete", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $deletePayload);
+        [$deleteStatus] = http_request("http://127.0.0.1:$port/?api=delete", 'POST', $authorizedJsonHeaders, $deletePayload);
         check($deleteStatus === 200, 'A current HTTP delete failed.');
         $hashAfterDelete = hash_file('sha256', $httpCopy);
         $stalePayload = json_encode(['id' => $post['result']['id'], 'baseRevision' => $post['result']['revision'], 'title' => 'Stale after delete', 'body' => 'draft', 'tags' => []], JSON_THROW_ON_ERROR);
-        [$staleStatus, , $staleBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $stalePayload);
+        [$staleStatus, , $staleBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $stalePayload);
         $staleResponse = json_decode($staleBody, true, 16, JSON_THROW_ON_ERROR);
         check($staleStatus === 409 && array_key_exists('current', $staleResponse) && $staleResponse['current'] === null, 'A stale edit after deletion did not return 409/current:null.');
         check(hash_file('sha256', $httpCopy) === $hashAfterDelete, 'A stale edit after deletion changed the file.');
     } finally {
         @chmod($httpRoot, 0700);
-        $stopped = terminate_process($server, 1.0);
-        if ($stopped) proc_close($server);
-        else throw new RuntimeException('The HTTP test server could not be terminated.');
+        stop_test_server($server, 'HTTP');
     }
 
-    $closedRoot = $temporaryRoot . '/closed-local';
-    check(mkdir($closedRoot, 0700) && make_fixture($source, $closedRoot . '/index.php'), 'Could not create the deny-by-default fixture.');
-    $closedPort = free_port();
-    $closedEnvironment = getenv();
-    $closedEnvironment = is_array($closedEnvironment) ? $closedEnvironment : [];
-    unset($closedEnvironment['PHPLET_PASSWORD'], $closedEnvironment['PHPLET_ALLOW_PASSWORDLESS']);
-    $closedPipes = [];
-    $closedServer = proc_open([PHP_BINARY, '-S', "127.0.0.1:$closedPort", '-t', $closedRoot], [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']], $closedPipes, $closedRoot, $closedEnvironment);
-    check(is_resource($closedServer), 'Could not start the deny-by-default server.');
-    fclose($closedPipes[0]);
+    $closedCopy = fixture_copy($temporaryRoot, $source, 'closed-local', 'Could not create the deny-by-default fixture.');
+    $closedRoot = dirname($closedCopy);
+    [$closedServer, $closedPort] = start_test_server($closedRoot, test_environment(), 'Could not start the deny-by-default server.');
     try {
-        wait_for_server($closedPort);
         [$closedStatus] = http_request("http://127.0.0.1:$closedPort/", 'GET', ['Host: localhost', 'X-Forwarded-For: 127.0.0.1']);
         check($closedStatus === 403, 'Passwordless HTTP was enabled without an explicit local-development opt-in.');
     } finally {
-        $stopped = terminate_process($closedServer, 1.0);
-        if ($stopped) proc_close($closedServer);
-        else throw new RuntimeException('The deny-by-default test server could not be terminated.');
+        stop_test_server($closedServer, 'deny-by-default');
     }
 
-    $authRoot = $temporaryRoot . '/auth';
-    check(mkdir($authRoot, 0700) && make_fixture($source, $authRoot . '/index.php'), 'Could not create the authentication fixture.');
-    $authPort = free_port();
-    $authEnvironment = getenv();
-    $authEnvironment = is_array($authEnvironment) ? $authEnvironment : [];
-    unset($authEnvironment['PHPLET_ALLOW_PASSWORDLESS']);
-    $authEnvironment['PHPLET_PASSWORD'] = 'correct horse battery staple';
-    $authPipes = [];
-    $authServer = proc_open([PHP_BINARY, '-S', "127.0.0.1:$authPort", '-t', $authRoot], [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']], $authPipes, $authRoot, $authEnvironment);
-    check(is_resource($authServer), 'Could not start the authenticated test server.');
-    fclose($authPipes[0]);
+    $authCopy = fixture_copy($temporaryRoot, $source, 'auth', 'Could not create the authentication fixture.');
+    $authRoot = dirname($authCopy);
+    [$authServer, $authPort] = start_test_server(
+        $authRoot,
+        test_environment(['PHPLET_PASSWORD' => 'correct horse battery staple']),
+        'Could not start the authenticated test server.'
+    );
     try {
-        wait_for_server($authPort);
         $authHash = hash_file('sha256', $authRoot . '/index.php');
         [$anonymousStatus, $anonymousHeaders] = http_request("http://127.0.0.1:$authPort/");
         check($anonymousStatus === 401 && header_value($anonymousHeaders, 'WWW-Authenticate') !== null, 'Password mode did not challenge an anonymous request.');
@@ -2196,9 +2337,7 @@ PHP;
         [$spacedStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic  ' . base64_encode('writer:correct horse battery staple')]);
         check($spacedStatus === 200, 'The fallback parser rejected valid repeated authentication whitespace.');
     } finally {
-        $stopped = terminate_process($authServer, 1.0);
-        if ($stopped) proc_close($authServer);
-        else throw new RuntimeException('The authenticated test server could not be terminated.');
+        stop_test_server($authServer, 'authenticated');
     }
 
     check(hash_file('sha256', $source) === $sourceHashBefore, 'The test runner changed the source phplet.');

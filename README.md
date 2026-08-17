@@ -5,7 +5,7 @@ phplet is a small, self-modifying wiki. Its PHP, HTML, CSS, JavaScript, and ever
 ```text
 phplet.php
 ├── PHP persistence and HTTP API
-├── HTML, editable CSS tokens, and browser UI
+├── HTML, editable CSS, and browser UI
 ├── __halt_compiler();
 ├── PIPLET-DATA/1
 └── { versioned JSON notes and appearance }
@@ -39,7 +39,7 @@ That uses HTTP Basic authentication. Use HTTPS whenever traffic leaves your mach
 - `Ctrl/⌘ S` saves; `Esc` cancels; `/` searches; `N` creates; `E` edits the first open note.
 - Drafts whose serialized recovery record is at most 524,288 JavaScript string units survive an accidental navigation in `sessionStorage`, subject to the browser's own quota. Only an explicit save changes the PHP file. If recovery storage is full or a draft is larger, phplet keeps that editor open and asks you to save before switching. A later read-only launch still exposes an available browser recovery draft for copying.
 - Note bodies support headings, lists, block quotes, fenced code, `**bold**`, inline backticks, and `[[label|note-id]]` links.
-- `Appearance` previews and saves a coordinated palette, reading font, text size, line length, and optional typed CSS layout tokens.
+- `Appearance` previews and saves a coordinated palette, reading font, text size, line length, and an optional custom stylesheet.
 - `Download a snapshot` exports a runnable backup: restoring it restores both app and notes.
 
 Two editors can safely change different notes. Each note and the shared appearance carry revisions. A stale note save returns HTTP 409 with explicit keep/replace choices; a stale appearance save keeps the local preview and asks you to cancel or save again. New-note requests carry a stable creation token, so retrying after a lost response does not create a second slug while the original note exists.
@@ -48,23 +48,13 @@ Two editors can safely change different notes. Each note and the shared appearan
 
 Choose `Appearance` in the top bar. Every choice previews across the whole page immediately; `Cancel` restores the saved look, while `Restore defaults` previews the original design until you save. Palette, reading font, text size, and line length are stored in the PHP file so they travel with a downloaded snapshot. System/light/dark is kept on the current device and never rewrites the file by itself.
 
-The advanced **Design tokens** section edits a small, allowlisted CSS-variable module inside the app. Token overrides take precedence over related presets until removed. The complete module is:
+The advanced **Custom CSS** section is a complete override stylesheet, not a variables-only form. It accepts selectors, declarations, media queries, and custom properties up to 32 KiB. It comes after the built-in stylesheet, so it can restyle any part of the interface without copying the base theme.
 
-| Token | Accepted range |
-| --- | --- |
-| `--story-width` | 32–80 `rem` |
-| `--measure` | 42–90 `ch` |
-| `--sidebar` | 12–28 `rem` |
-| `--radius` | 0–24 `px` |
-| `--radius-sm` | 0–16 `px` |
-| `--copy-size` | 0.8–1.6 `rem` |
-| `--title-size` | 1.5–4 `rem` |
+Custom CSS can also hide or rearrange the editor. Add `?safe=1` to the page URL to load phplet with the stored stylesheet disabled; the CSS remains available in Appearance so it can be fixed or cleared. phplet assigns the stylesheet through a text node rather than HTML, and its Content Security Policy blocks remote styles, fonts, and image URLs. Scripts in CSS text do not become executable markup.
 
-The immutable base stylesheet remains separate, and arbitrary selectors, URLs, declarations, and scripts are rejected. Color stays in the coordinated light/dark palettes so a light override cannot make the dark theme unreadable.
+There are no remote fonts, icons, images, or CSS frameworks. The default theme is an editorial notebook rather than a generic dashboard: warm paper, ink, deep teal, serif reading type, hairline-separated notes, and a responsive story river.
 
-There are no remote fonts, icons, images, or CSS frameworks. The default theme is an editorial notebook rather than a generic dashboard: warm paper, ink, deep teal, serif reading type, hairline-separated notes, and a responsive story river. A dark palette is beside the light tokens.
-
-The interface exposes coordinated, contrast-aware color presets plus typed layout variables instead of accepting arbitrary CSS. Manual source edits are still supported: keep the `__halt_compiler()` call and everything beneath it in place, and deploy source changes while no save is in flight. Stored appearance records tolerate newly added or retired settings and fall back to current defaults, so ordinary source upgrades do not brick an existing file. After PHP recompiles the edited prefix, later saves preserve that new prefix exactly. If OPcache timestamp validation is disabled, invalidate OPcache once after changing application code. Ordinary saves do not require invalidation because the compiled prefix never changes.
+The built-in presets are coordinated and contrast-aware; custom CSS is deliberately unconstrained and can override them. Manual source edits are also supported: keep the `__halt_compiler()` call and everything beneath it in place, and deploy source changes while no save is in flight. Stored appearance records tolerate newly added or retired settings and fall back to current defaults; older layout-token records are converted to equivalent CSS. After PHP recompiles the edited prefix, later saves preserve that new prefix exactly. If OPcache timestamp validation is disabled, invalidate OPcache once after changing application code. Ordinary saves do not require invalidation because the compiled prefix never changes.
 
 ## How a save works
 
@@ -97,4 +87,4 @@ The dependency-free test runner always copies the application to a unique tempor
 php tests/run.php
 ```
 
-It covers CRUD, idempotent creates, appearance migration and tokens, stale revisions, private temporary files, hostile/Unicode text, immutable-prefix preservation, PHP linting after saves, HTTP/auth/CSRF behavior, multi-megabyte snapshots, and concurrent writers queued across inode replacements. When Chrome or Chromium is available, it also runs real browser regressions for held/double saves, conflict and read-only draft recovery, unavailable browser storage, bounded story/index rendering, theme-only saves, and live appearance previews. Without Chrome, the runner reports that those dynamic browser scenarios were skipped and performs only static guard checks for their critical code paths.
+It covers CRUD, idempotent creates, appearance and legacy-token migration, stale revisions, private temporary files, hostile/Unicode text and CSS, immutable-prefix preservation, PHP linting after saves, HTTP/auth/CSRF behavior, multi-megabyte snapshots, and concurrent writers queued across inode replacements. When Chrome or Chromium is available, it also runs real browser regressions for held/double saves, conflict and read-only draft recovery, unavailable browser storage, bounded story/index rendering, theme-only saves, full CSS previews, safe appearance mode, and mobile focus. Without Chrome, the runner reports that those dynamic browser scenarios were skipped and performs only static guard checks for their critical code paths.
