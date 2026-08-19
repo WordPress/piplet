@@ -1,15 +1,15 @@
 <?php
 declare(strict_types=1);
 
-/* A dependency-free black-box test runner. The source phplet is never mutated. */
+/* A dependency-free black-box test runner. The source piplet is never mutated. */
 
 if (($argv[1] ?? '') === '--worker') {
     worker_main($argv);
 }
 
 $root = dirname(__DIR__);
-$source = $root . '/phplet.php';
-$temporaryRoot = sys_get_temp_dir() . '/phplet-tests-' . bin2hex(random_bytes(6));
+$source = $root . '/piplet.php';
+$temporaryRoot = sys_get_temp_dir() . '/piplet-tests-' . bin2hex(random_bytes(6));
 $copy = $temporaryRoot . '/index.php';
 $sourceHashBefore = is_file($source) ? hash_file('sha256', $source) : false;
 $assertions = 0;
@@ -40,8 +40,8 @@ function make_fixture(string $source, string $destination): bool
         'notes' => [
             'welcome' => [
                 'id' => 'welcome',
-                'title' => 'Hello, phplet',
-                'body' => "This is a **phplet**: a single file php application.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[Hello, phplet|welcome]]` links one note to another",
+                'title' => 'Hello, piplet',
+                'body' => "This is a **piplet**: a single file php application.\n\n## markup\n\n- `#` makes a heading\n- `-` makes a list\n- `**words**` adds emphasis\n- `[[Hello, piplet|welcome]]` links one note to another",
                 'tags' => ['welcome', 'simplicity'],
                 'revision' => 1,
                 'created' => '2026-08-15T05:30:00Z',
@@ -89,18 +89,18 @@ function worker_main(array $arguments): never
     $target = $arguments[2] ?? '';
     $action = $arguments[3] ?? '';
     $encoded = $arguments[4] ?? '';
-    define('PHPLET_LIBRARY_ONLY', true);
+    define('PIPLET_LIBRARY_ONLY', true);
     require $target;
 
     try {
         $input = $encoded === '' ? [] : json_decode(base64_decode($encoded, true), true, 16, JSON_THROW_ON_ERROR);
         $result = match ($action) {
-            'read' => phplet_read(),
-            'save' => phplet_save_note($input),
-            'delete' => phplet_delete_note($input),
-            'appearance' => phplet_save_appearance($input),
-            'current-appearance' => phplet_current_appearance(phplet_read()),
-            'prefix' => hash('sha256', substr(file_get_contents(phplet_path()), 0, phplet_code_offset())),
+            'read' => piplet_read(),
+            'save' => piplet_save_note($input),
+            'delete' => piplet_delete_note($input),
+            'appearance' => piplet_save_appearance($input),
+            'current-appearance' => piplet_current_appearance(piplet_read()),
+            'prefix' => hash('sha256', substr(file_get_contents(piplet_path()), 0, piplet_code_offset())),
             'held-save' => worker_held_save($input),
             'large-save' => worker_large_save($input),
             'summary' => worker_summary(),
@@ -110,12 +110,12 @@ function worker_main(array $arguments): never
             'inject-appearance' => worker_inject_appearance($input),
             'duplicate-token' => worker_duplicate_token(),
             'numeric-id' => worker_numeric_id(),
-            'cookie-path' => phplet_cookie_path((string) ($input['script'] ?? '/')),
+            'cookie-path' => piplet_cookie_path((string) ($input['script'] ?? '/')),
             default => throw new RuntimeException('Unknown worker action.'),
         };
         fwrite(STDOUT, json_encode(['ok' => true, 'value' => $result], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE));
         exit(0);
-    } catch (PhpletConflict $error) {
+    } catch (PipletConflict $error) {
         fwrite(STDOUT, json_encode(['ok' => false, 'conflict' => true, 'current' => $error->current], JSON_THROW_ON_ERROR));
         exit(3);
     } catch (Throwable $error) {
@@ -128,12 +128,12 @@ function worker_held_save(array $input): array
 {
     $hold = max(0, min(500000, (int) ($input['hold'] ?? 0)));
     $title = (string) ($input['title'] ?? 'Concurrent note');
-    return phplet_mutate(function (array &$document) use ($hold, $title): array {
+    return piplet_mutate(function (array &$document) use ($hold, $title): array {
         if ($hold > 0) {
             usleep($hold);
         }
-        $id = phplet_slug($title, $document['notes']);
-        $now = phplet_now();
+        $id = piplet_slug($title, $document['notes']);
+        $now = piplet_now();
         $note = [
             'id' => $id,
             'title' => $title,
@@ -152,7 +152,7 @@ function worker_large_save(array $input): array
 {
     $bytes = max(0, (int) ($input['bytes'] ?? 0));
     $id = isset($input['id']) && is_string($input['id']) ? $input['id'] : null;
-    $saved = phplet_save_note([
+    $saved = piplet_save_note([
         'id' => $id,
         'baseRevision' => (int) ($input['baseRevision'] ?? 0),
         'title' => (string) ($input['title'] ?? 'Large note'),
@@ -169,19 +169,19 @@ function worker_large_save(array $input): array
 
 function worker_summary(): array
 {
-    $document = phplet_read();
+    $document = piplet_read();
     return [
         'revision' => $document['revision'],
         'notes' => count($document['notes']),
-        'bytes' => filesize(phplet_path()),
+        'bytes' => filesize(piplet_path()),
     ];
 }
 
 function worker_seed_notes(array $input): array
 {
     $count = max(0, min(100, (int) ($input['count'] ?? 0)));
-    return phplet_mutate(function (array &$document) use ($count): array {
-        $now = phplet_now();
+    return piplet_mutate(function (array &$document) use ($count): array {
+        $now = piplet_now();
         for ($index = 0; $index < $count; $index++) {
             $id = "story-cap-$index";
             $document['notes'][$id] = [
@@ -204,7 +204,7 @@ function worker_temp_info(array $input): array
     $temp = '';
     $handle = null;
     try {
-        [$temp, $handle] = phplet_open_temp(phplet_path());
+        [$temp, $handle] = piplet_open_temp(piplet_path());
         $stat = fstat($handle);
         return [
             'mode' => ((int) $stat['mode']) & 0777,
@@ -220,7 +220,7 @@ function worker_temp_info(array $input): array
 
 function worker_inject_appearance(array $input): array
 {
-    return phplet_mutate(function (array &$document) use ($input): array {
+    return piplet_mutate(function (array &$document) use ($input): array {
         $document['appearance'] = ['revision' => $document['revision'] + 1, ...$input];
         return $document['appearance'];
     });
@@ -228,8 +228,8 @@ function worker_inject_appearance(array $input): array
 
 function worker_duplicate_token(): array
 {
-    return phplet_mutate(function (array &$document): array {
-        $now = phplet_now();
+    return piplet_mutate(function (array &$document): array {
+        $now = piplet_now();
         foreach (['duplicate-one', 'duplicate-two'] as $id) {
             $document['notes'][$id] = [
                 'id' => $id, 'title' => $id, 'body' => '', 'tags' => [],
@@ -244,11 +244,11 @@ function worker_duplicate_token(): array
 
 function worker_numeric_id(): array
 {
-    return phplet_mutate(function (array &$document): array {
+    return piplet_mutate(function (array &$document): array {
         $document['notes']['01'] = [
             'id' => '01', 'title' => 'Numeric identifier', 'body' => '', 'tags' => [],
             'revision' => $document['revision'] + 1,
-            'created' => phplet_now(), 'updated' => phplet_now(),
+            'created' => piplet_now(), 'updated' => piplet_now(),
         ];
         return [];
     });
@@ -372,7 +372,7 @@ function test_environment(array $set = []): array
 {
     $environment = getenv();
     $environment = is_array($environment) ? $environment : [];
-    unset($environment['PHPLET_PASSWORD'], $environment['PHPLET_ALLOW_PASSWORDLESS']);
+    unset($environment['PIPLET_PASSWORD'], $environment['PIPLET_ALLOW_PASSWORDLESS']);
     return [...$environment, ...$set];
 }
 
@@ -406,7 +406,7 @@ function stop_test_server($process, string $name): void
 
 function chrome_binary(): ?string
 {
-    $configured = getenv('PHPLET_CHROME');
+    $configured = getenv('PIPLET_CHROME');
     if (is_string($configured) && is_executable($configured)) return $configured;
     $candidates = [
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -542,7 +542,7 @@ function run_browser_scenario(
                     else $stderr .= $chunk;
                 }
             }
-            if (preg_match('/<output id="phplet-browser-result">([^<]*)<\/output>/', $stdout, $found) === 1) {
+            if (preg_match('/<output id="piplet-browser-result">([^<]*)<\/output>/', $stdout, $found) === 1) {
                 $match = html_entity_decode($found[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 break;
             }
@@ -566,7 +566,7 @@ function run_browser_scenario(
         remove_tree($profile);
         if (!$stopped) throw new RuntimeException('The browser process could not be terminated.');
     }
-    if ($match === null && preg_match('/<output id="phplet-browser-result">([^<]*)<\/output>/', $stdout, $found) === 1) {
+    if ($match === null && preg_match('/<output id="piplet-browser-result">([^<]*)<\/output>/', $stdout, $found) === 1) {
         $match = html_entity_decode($found[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
     }
     if ($match === null) {
@@ -635,17 +635,17 @@ function stop_live_workers(): bool
 
 $exitStatus = 0;
 try {
-    check(is_file($source), 'phplet.php is missing.');
+    check(is_file($source), 'piplet.php is missing.');
     check(mkdir($temporaryRoot, 0700), 'Could not create the test directory.');
     $temporaryRootOwned = true;
     $temporaryRootIdentity = lstat($temporaryRoot);
     check(is_array($temporaryRootIdentity), 'Could not identify the test directory.');
     $liveDocument = worker_command($source, 'read');
-    check(($liveDocument['format'] ?? null) === 1, 'The live phplet data cannot be read.');
+    check(($liveDocument['format'] ?? null) === 1, 'The live piplet data cannot be read.');
     check(make_fixture($source, $copy), 'Could not make an isolated test copy.');
 
     $initialLint = run_bounded_command([PHP_BINARY, '-l', $copy]);
-    check($initialLint['status'] === 0, 'The initial phplet does not lint.');
+    check($initialLint['status'] === 0, 'The initial piplet does not lint.');
     $timeoutObserved = false;
     try {
         run_bounded_command([PHP_BINARY, '-r', 'usleep(500000);'], .05);
@@ -661,8 +661,8 @@ try {
     check(isset($initial['notes']['welcome']), 'The welcome note is missing.');
     $numericIdFailure = finish_worker(start_worker($copy, 'numeric-id', []), 2);
     check(str_contains($numericIdFailure['stderr'], 'Invalid note identifier'), 'A stored numeric-only note identifier passed validation.');
-    check(worker_command($copy, 'cookie-path', ['script' => '/notes./phplet.php']) === '/notes./', 'A trailing dot was stripped from the CSRF cookie directory.');
-    check(worker_command($copy, 'cookie-path', ['script' => '/phplet.php']) === '/', 'The root CSRF cookie path was malformed.');
+    check(worker_command($copy, 'cookie-path', ['script' => '/notes./piplet.php']) === '/notes./', 'A trailing dot was stripped from the CSRF cookie directory.');
+    check(worker_command($copy, 'cookie-path', ['script' => '/piplet.php']) === '/', 'The root CSRF cookie path was malformed.');
     $sourceText = file_get_contents($source);
     check(is_string($sourceText), 'Could not read the production CSS for contrast checks.');
     check(
@@ -703,7 +703,7 @@ try {
         );
     }
     $previousUmask = umask(0);
-    $visibleTemp = tempnam(dirname($copy), '.phplet-visible-');
+    $visibleTemp = tempnam(dirname($copy), '.piplet-visible-');
     umask($previousUmask);
     check(is_string($visibleTemp), 'The runtime could not create a temporary file for the first-visibility check.');
     $visiblePermissions = fileperms($visibleTemp);
@@ -713,8 +713,8 @@ try {
     foreach ([0, 0777] as $testUmask) {
         $tempInfo = worker_command($copy, 'temp-info', ['umask' => $testUmask]);
         check($tempInfo['mode'] === 0600, 'A temporary snapshot was not private from first use.');
-        check(realpath($tempInfo['directory']) === realpath(dirname($copy)), 'A temporary snapshot was not created beside the phplet.');
-        check(str_contains($tempInfo['basename'], '.phplet-tmp-') && str_ends_with($tempInfo['basename'], '.php'), 'A temporary snapshot lost its guarded PHP name.');
+        check(realpath($tempInfo['directory']) === realpath(dirname($copy)), 'A temporary snapshot was not created beside the piplet.');
+        check(str_contains($tempInfo['basename'], '.piplet-tmp-') && str_ends_with($tempInfo['basename'], '.php'), 'A temporary snapshot lost its guarded PHP name.');
     }
 
     $defaultAppearance = [
@@ -805,7 +805,7 @@ try {
         ['baseRevision' => 0, 'appearance' => 'ocean'],
     ] as $invalidAppearance) {
         $failure = finish_worker(start_worker($invalidAppearanceCopy, 'appearance', $invalidAppearance), 2);
-        check(str_contains($failure['stderr'], 'PhpletHttpError'), 'Invalid appearance input was not rejected as a request error.');
+        check(str_contains($failure['stderr'], 'PipletHttpError'), 'Invalid appearance input was not rejected as a request error.');
     }
     check(hash_file('sha256', $invalidAppearanceCopy) === $invalidAppearanceHash, 'Invalid appearance input changed the file.');
     check(worker_command($invalidAppearanceCopy, 'current-appearance') === $defaultAppearance, 'Invalid appearance input changed the effective defaults.');
@@ -872,11 +872,11 @@ try {
 
     $abaCopy = fixture_copy($temporaryRoot, $source, 'aba', 'Could not create the revision fixture.');
     $firstWelcomeEdit = worker_command($abaCopy, 'save', [
-        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, phplet', 'body' => 'first editor', 'tags' => [],
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, piplet', 'body' => 'first editor', 'tags' => [],
     ]);
     check($firstWelcomeEdit['result']['revision'] === 2, 'The first bundled-note edit did not advance its revision.');
     $staleWelcome = worker_conflict($abaCopy, 'save', [
-        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, phplet', 'body' => 'stale editor', 'tags' => [],
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Hello, piplet', 'body' => 'stale editor', 'tags' => [],
     ]);
     check($staleWelcome['current']['body'] === 'first editor', 'A stale bundled-note editor was not rejected.');
     worker_command($abaCopy, 'delete', ['id' => 'welcome', 'baseRevision' => 2]);
@@ -942,7 +942,7 @@ try {
     }
     check($afterConcurrency['revision'] === 30, 'Concurrent document revisions were lost.');
     check($prefixBefore === worker_command($copy, 'prefix'), 'A save changed the executable prefix.');
-    check(glob($temporaryRoot . '/.phplet-tmp-*.php') === [], 'A temporary snapshot was left behind.');
+    check(glob($temporaryRoot . '/.piplet-tmp-*.php') === [], 'A temporary snapshot was left behind.');
 
     // Deterministically exercise the stale-inode retry. Instrument only this
     // disposable copy: A opens inode 1 and pauses; B replaces it with inode 2;
@@ -952,17 +952,17 @@ try {
     $raceSource = file_get_contents($raceCopy);
     $needle = <<<'PHP'
         if ($handle === false) {
-            throw new RuntimeException('Cannot open the phplet for saving.');
+            throw new RuntimeException('Cannot open the piplet for saving.');
         }
 
         try {
 PHP;
     $instrumented = <<<'PHP'
         if ($handle === false) {
-            throw new RuntimeException('Cannot open the phplet for saving.');
+            throw new RuntimeException('Cannot open the piplet for saving.');
         }
 
-        $testBarrier = getenv('PHPLET_TEST_OPEN_BARRIER');
+        $testBarrier = getenv('PIPLET_TEST_OPEN_BARRIER');
         if (is_string($testBarrier) && $testBarrier !== '' && !is_file($testBarrier . '.passed')) {
             file_put_contents($testBarrier . '.opened', '1');
             $testDeadline = microtime(true) + 5;
@@ -982,7 +982,7 @@ PHP;
     $barrier = $raceRoot . '/barrier';
     $workerEnvironment = getenv();
     $workerEnvironment = is_array($workerEnvironment) ? $workerEnvironment : [];
-    $workerEnvironment['PHPLET_TEST_OPEN_BARRIER'] = $barrier;
+    $workerEnvironment['PIPLET_TEST_OPEN_BARRIER'] = $barrier;
     clearstatcache(true, $raceCopy);
     $oldInode = fileinode($raceCopy);
     $staleWorker = start_worker($raceCopy, 'held-save', ['title' => 'Opened before rename', 'hold' => 0], $workerEnvironment);
@@ -1010,7 +1010,7 @@ PHP;
     $faultReplacement = <<<'PHP'
         $tempHandle = null;
 
-        if (getenv('PHPLET_TEST_FAIL_BEFORE_RENAME') === '1') {
+        if (getenv('PIPLET_TEST_FAIL_BEFORE_RENAME') === '1') {
             throw new RuntimeException('Injected failure before rename.');
         }
 
@@ -1021,11 +1021,11 @@ PHP;
     $faultHash = hash_file('sha256', $faultCopy);
     $faultEnvironment = getenv();
     $faultEnvironment = is_array($faultEnvironment) ? $faultEnvironment : [];
-    $faultEnvironment['PHPLET_TEST_FAIL_BEFORE_RENAME'] = '1';
+    $faultEnvironment['PIPLET_TEST_FAIL_BEFORE_RENAME'] = '1';
     $faultFailure = finish_worker(start_worker($faultCopy, 'save', ['id' => null, 'baseRevision' => 0, 'title' => 'Faulted save', 'body' => '', 'tags' => []], $faultEnvironment), 2);
     check(str_contains($faultFailure['stderr'], 'Injected failure'), 'The post-temp persistence failure was not reached.');
     check(hash_file('sha256', $faultCopy) === $faultHash, 'A failed pre-rename commit changed the canonical file.');
-    check(glob($faultRoot . '/.phplet-tmp-*.php') === [], 'A failed pre-rename commit left its temporary snapshot.');
+    check(glob($faultRoot . '/.piplet-tmp-*.php') === [], 'A failed pre-rename commit left its temporary snapshot.');
 
     $modeCopy = fixture_copy($temporaryRoot, $source, 'mode', 'Could not create the mode fixture.');
     check(chmod($modeCopy, 0440), 'Could not set the mode fixture permissions.');
@@ -1041,7 +1041,7 @@ PHP;
     check(link($hardCopy, $hardRoot . '/alias.php'), 'Could not create a hard-linked alias.');
     $hardHash = hash_file('sha256', $hardCopy);
     $hardFailure = finish_worker(start_worker($hardCopy, 'save', ['id' => null, 'baseRevision' => 0, 'title' => 'Must fail', 'body' => '', 'tags' => []]), 2);
-    check(str_contains($hardFailure['stderr'], 'Hard-linked phplets'), 'A hard-linked deployment was not rejected clearly.');
+    check(str_contains($hardFailure['stderr'], 'Hard-linked piplets'), 'A hard-linked deployment was not rejected clearly.');
     check(hash_file('sha256', $hardCopy) === $hardHash, 'Hard-link rejection changed the canonical file.');
 
     $largeCopy = fixture_copy($temporaryRoot, $source, 'large', 'Could not create the large-data fixture.');
@@ -1063,21 +1063,21 @@ PHP;
     $beforeOversize = hash_file('sha256', $largeCopy);
     $oversize = finish_worker(start_worker($largeCopy, 'large-save', ['title' => 'Over the limit', 'bytes' => 1400000]), 2);
     check(
-        str_contains($oversize['stderr'], 'PhpletHttpError: This save would make the phplet larger than 8 MiB.'),
+        str_contains($oversize['stderr'], 'PipletHttpError: This save would make the piplet larger than 8 MiB.'),
         'An over-limit snapshot did not reach the exact file-size guard.'
     );
     check(hash_file('sha256', $largeCopy) === $beforeOversize, 'An over-limit save changed the canonical file.');
-    check(glob($largeRoot . '/.phplet-tmp-*.php') === [], 'An over-limit save left a temporary snapshot.');
+    check(glob($largeRoot . '/.piplet-tmp-*.php') === [], 'An over-limit save left a temporary snapshot.');
     $largeElapsed = microtime(true) - $largeStart;
 
     $savedLint = run_bounded_command([PHP_BINARY, '-l', $copy]);
-    check($savedLint['status'] === 0, 'The saved phplet no longer lints.');
+    check($savedLint['status'] === 0, 'The saved piplet no longer lints.');
 
     // Exercise the actual HTML and JSON API against another isolated copy.
     $httpCopy = fixture_copy($temporaryRoot, $source, 'http', 'Could not create the HTTP fixture.');
     $httpRoot = dirname($httpCopy);
     $browserHarness = <<<'PHP'
-    <script nonce="<?= phplet_h($nonce) ?>">
+    <script nonce="<?= piplet_h($nonce) ?>">
     (() => {
         const browserMode = new URLSearchParams(location.search).get('__browser');
         if (!['state', 'mobile', 'safe'].includes(browserMode)) return;
@@ -1085,7 +1085,7 @@ PHP;
         addEventListener('error', event => runtimeErrors.push(event.message || 'window error'));
         addEventListener('unhandledrejection', event => runtimeErrors.push(String(event.reason?.message || event.reason || 'unhandled rejection')));
         const result = document.createElement('output');
-        result.id = 'phplet-browser-result';
+        result.id = 'piplet-browser-result';
         const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
         const until = async (predicate, message, milliseconds = 4000) => {
             const deadline = performance.now() + milliseconds;
@@ -1112,20 +1112,20 @@ PHP;
         const progress = label => nativeFetch(`?__browser_progress=${encodeURIComponent(`${browserMode}:${label}`)}`).catch(() => null);
         if (browserMode === 'safe') {
             const runSafe = async () => {
-                const state = JSON.parse(document.getElementById('phplet-state').textContent);
+                const state = JSON.parse(document.getElementById('piplet-state').textContent);
                 assert(state.safeAppearance && state.appearance.customCss, 'safe mode lost the stored custom CSS');
-                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode applied stored custom CSS');
+                assert(document.getElementById('piplet-custom-style').textContent === '', 'safe mode applied stored custom CSS');
                 assert(document.querySelector('.safe-appearance'), 'safe mode did not explain how to recover');
                 document.getElementById('appearance-button').click();
                 await until(() => document.getElementById('appearance-dialog').open, 'appearance did not open in safe mode');
                 const editor = document.getElementById('appearance-css');
                 assert(editor.value === state.appearance.customCss, 'safe mode did not keep custom CSS editable');
                 input(editor, '* { display: none !important; }');
-                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode live-previewed custom CSS');
+                assert(document.getElementById('piplet-custom-style').textContent === '', 'safe mode live-previewed custom CSS');
                 input(editor, '');
                 document.getElementById('appearance-form').requestSubmit();
                 await until(() => !document.getElementById('appearance-dialog').open, 'safe mode could not clear custom CSS');
-                assert(document.getElementById('phplet-custom-style').textContent === '', 'safe mode applied CSS while clearing it');
+                assert(document.getElementById('piplet-custom-style').textContent === '', 'safe mode applied CSS while clearing it');
                 const snapshot = await nativeFetch('?download=1').then(response => response.text());
                 const marker = '\nPIPLET-DATA/1\n';
                 const documentState = JSON.parse(snapshot.slice(snapshot.lastIndexOf(marker) + marker.length).trim());
@@ -1199,7 +1199,7 @@ PHP;
             return;
         }
         const run = async () => {
-            const csrf = document.querySelector('meta[name="phplet-csrf"]').content;
+            const csrf = document.querySelector('meta[name="piplet-csrf"]').content;
             const api = (action, payload) => nativeFetch(`?api=${action}`, {
                 method: 'POST', credentials: 'same-origin',
                 headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
@@ -1210,12 +1210,12 @@ PHP;
                 await until(() => [...document.querySelectorAll('.library-item')].some(node => node.querySelector('.library-title')?.textContent === title), `library search did not find ${title}`);
                 return [...document.querySelectorAll('.library-item')].find(node => node.querySelector('.library-title')?.textContent === title);
             };
-            await progress(`start:${sessionStorage.getItem('phplet-browser-phase') || 'main'}`);
+            await progress(`start:${sessionStorage.getItem('piplet-browser-phase') || 'main'}`);
             assert(document.getElementById('global-status').textContent === ''
                 && document.getElementById('global-status').getAttribute('role') === 'status',
                 'the header started with stale status copy or lost its live-region semantics');
             assert(!document.getElementById('file-size'), 'the idle header displayed file metadata');
-            if (sessionStorage.getItem('phplet-browser-phase') === 'read-only') {
+            if (sessionStorage.getItem('piplet-browser-phase') === 'read-only') {
                 await until(() => document.querySelector('.plain-note[aria-label="Recovered draft text"]'), 'read-only page did not expose its browser draft');
                 const expectedRecoveries = new Map([
                     ['Read-only recovery', {body: 'copy this text while the file is read-only', tag: 'first-tag'}],
@@ -1274,22 +1274,22 @@ PHP;
                 button(document.querySelector('.editor'), 'Dismiss recovery').click();
                 await until(() => !document.querySelector('.plain-note[aria-label="Recovered draft text"]'), 'read-only recoveries did not finish after explicit dismissal');
                 assert(!Object.keys(sessionStorage).some(key => key.includes('draft:stale-migration')), 'read-only dismissal left a linked stale recovery copy');
-                assert(sessionStorage.getItem('phplet-browser-foreign') === 'keep me', 'a recovery link cleared unrelated session storage');
+                assert(sessionStorage.getItem('piplet-browser-foreign') === 'keep me', 'a recovery link cleared unrelated session storage');
                 const malformedKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:bad-json'));
                 assert(malformedKey && sessionStorage.getItem(malformedKey) === '{', 'a malformed recovery hid valid drafts or was deleted');
                 sessionStorage.removeItem(malformedKey);
-                sessionStorage.removeItem('phplet-browser-foreign');
+                sessionStorage.removeItem('piplet-browser-foreign');
                 await until(() => document.activeElement === document.getElementById('main'), 'focus was not restored after the final recovery');
-                sessionStorage.removeItem('phplet-browser-phase');
+                sessionStorage.removeItem('piplet-browser-phase');
                 await progress('read-only:done');
                 return;
             }
-            if (sessionStorage.getItem('phplet-browser-phase') === 'orphan') {
+            if (sessionStorage.getItem('piplet-browser-phase') === 'orphan') {
                 await progress('orphan:entered');
                 await until(() => document.querySelector('.conflict-panel'), 'deleted-note draft was not recovered after reload');
                 assert(document.getElementById('edit-body').value === 'orphaned after remote delete',
                     `orphan recovery lost the draft text (opened ${document.getElementById('edit-title').value})`);
-                sessionStorage.removeItem('phplet-browser-phase');
+                sessionStorage.removeItem('piplet-browser-phase');
                 const currentOrphanKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:welcome'));
                 const staleOrphanKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:older-welcome'));
                 assert(currentOrphanKey && staleOrphanKey, 'the chained writable-orphan fixture was incomplete');
@@ -1335,15 +1335,15 @@ PHP;
                 currentRecovery.previousDraftKey = staleMigrationKey;
                 sessionStorage.setItem(newDraftKey, JSON.stringify(currentRecovery));
                 sessionStorage.setItem(draftPrefix + 'bad-json', '{');
-                sessionStorage.setItem('phplet-browser-foreign', 'keep me');
+                sessionStorage.setItem('piplet-browser-foreign', 'keep me');
                 sessionStorage.setItem(draftPrefix + 'story-cap-0', JSON.stringify({
                     id: 'story-cap-0', baseRevision: 1, title: 'Second recovery', body: '', tags: ['tag-only-change'],
-                    previousDraftKey: 'phplet-browser-foreign'
+                    previousDraftKey: 'piplet-browser-foreign'
                 }));
                 const madeReadOnly = await nativeFetch('?__browser_readonly=1');
                 assert(madeReadOnly.ok, 'test fixture could not become read-only');
                 assert(runtimeErrors.length === 0, `page error before read-only reload: ${runtimeErrors.join('; ')}`);
-                sessionStorage.setItem('phplet-browser-phase', 'read-only');
+                sessionStorage.setItem('piplet-browser-phase', 'read-only');
                 await progress('orphan:reload-read-only');
                 const reloadSetItem = Storage.prototype.setItem;
                 Storage.prototype.setItem = function (key, value) {
@@ -1353,7 +1353,7 @@ PHP;
                 location.reload();
                 await new Promise(() => {});
             }
-            if (sessionStorage.getItem('phplet-browser-phase') === 'superseded-orphan') {
+            if (sessionStorage.getItem('piplet-browser-phase') === 'superseded-orphan') {
                 await progress('superseded-orphan:entered');
                 await until(() => document.querySelector('.editor'), 'writable startup did not open its pending recovery migration');
                 assert(document.getElementById('edit-title').value === 'Authoritative recovery'
@@ -1379,9 +1379,9 @@ PHP;
                 }));
                 const predecessorItem = await findLibraryItem('Story cap 1');
                 predecessorItem.click();
-                await until(() => document.getElementById('phplet-note-story-cap-1'), 'the predecessor note did not open');
-                click(document.querySelector('#phplet-note-story-cap-1 button[title="Edit note"]'), 'edit a reserved predecessor key');
-                await until(() => document.querySelector('#phplet-note-story-cap-0.editor'), 'Edit did not prioritize the pending recovery owner');
+                await until(() => document.getElementById('piplet-note-story-cap-1'), 'the predecessor note did not open');
+                click(document.querySelector('#piplet-note-story-cap-1 button[title="Edit note"]'), 'edit a reserved predecessor key');
+                await until(() => document.querySelector('#piplet-note-story-cap-0.editor'), 'Edit did not prioritize the pending recovery owner');
                 assert(document.getElementById('edit-title').value === 'Authoritative component', 'Edit opened stale predecessor text instead of its owner');
                 button(document.querySelector('.conflict-panel'), 'Use saved version').click();
                 await until(() => !document.querySelector('.editor'), 'the pending edit owner did not close');
@@ -1393,17 +1393,17 @@ PHP;
                     previousDraftKeys: [`${draftPrefix}already-removed`]
                 }));
                 document.getElementById('new-button').click();
-                await until(() => document.querySelector('#phplet-note-story-cap-0.editor'), 'a dangling recovery link did not reopen its owner');
+                await until(() => document.querySelector('#piplet-note-story-cap-0.editor'), 'a dangling recovery link did not reopen its owner');
                 assert(document.getElementById('edit-title').value === 'Dangling-link owner', 'a dangling recovery link allowed its fixed key to be reused');
                 button(document.querySelector('.conflict-panel'), 'Use saved version').click();
                 await until(() => !document.querySelector('.editor'), 'dangling-link owner did not close after choosing the saved version');
                 assert(!sessionStorage.getItem(danglingOwnerKey), 'dangling-link owner recovery was not cleared');
 
-                const welcomeItem = await findLibraryItem('Hello, phplet');
+                const welcomeItem = await findLibraryItem('Hello, piplet');
                 assert(welcomeItem, 'welcome note was missing before story-cap recovery');
                 welcomeItem.click();
-                click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'story-cap welcome edit');
-                await until(() => document.querySelector('#phplet-note-welcome.editor'), 'story-cap editor did not open');
+                click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'story-cap welcome edit');
+                await until(() => document.querySelector('#piplet-note-welcome.editor'), 'story-cap editor did not open');
                 input(document.getElementById('edit-body'), 'orphaned after remote delete');
                 for (let index = 0; index < 25; index++) {
                     const title = `Story cap ${index}`;
@@ -1412,7 +1412,7 @@ PHP;
                     item.click();
                 }
                 assert(document.querySelectorAll('#story > article').length <= 20, 'the story rendered more than 20 open notes');
-                assert(document.querySelector('#phplet-note-welcome.editor') && document.getElementById('edit-body').value === 'orphaned after remote delete', 'the story cap evicted the live editor');
+                assert(document.querySelector('#piplet-note-welcome.editor') && document.getElementById('edit-body').value === 'orphaned after remote delete', 'the story cap evicted the live editor');
                 const openKey = Object.keys(sessionStorage).find(key => key.endsWith(':open'));
                 assert(openKey && JSON.parse(sessionStorage.getItem(openKey)).length <= 20, 'the persisted open-note set exceeded its cap');
                 window.dispatchEvent(new Event('pagehide'));
@@ -1433,7 +1433,7 @@ PHP;
                 const removed = await api('delete', {id: 'welcome', baseRevision: snapshotDocument.notes.welcome.revision});
                 assert(removed.ok, 'remote delete for orphan recovery failed');
                 assert(runtimeErrors.length === 0, `page error before orphan reload: ${runtimeErrors.join('; ')}`);
-                sessionStorage.setItem('phplet-browser-phase', 'orphan');
+                sessionStorage.setItem('piplet-browser-phase', 'orphan');
                 await progress('superseded-orphan:reload-orphan');
                 const orphanReloadSetItem = Storage.prototype.setItem;
                 Storage.prototype.setItem = function (key, value) {
@@ -1443,7 +1443,7 @@ PHP;
                 location.reload();
                 await new Promise(() => {});
             }
-            if (sessionStorage.getItem('phplet-browser-phase') === 'story-cap') {
+            if (sessionStorage.getItem('piplet-browser-phase') === 'story-cap') {
                 await progress('story-cap:entered');
                 assert(document.querySelectorAll('.library-item').length === 40, 'the library DOM exceeded its 40-note window');
                 assert(document.querySelector('.library-empty')?.textContent.includes('Refine the search'), 'the capped library did not explain how to find older notes');
@@ -1465,7 +1465,7 @@ PHP;
                     title: 'Authoritative recovery', body: 'latest text', tags: ['current'],
                     previousDraftKeys: [staleKey]
                 }));
-                sessionStorage.setItem('phplet-browser-phase', 'superseded-orphan');
+                sessionStorage.setItem('piplet-browser-phase', 'superseded-orphan');
                 await progress('story-cap:reload-superseded-orphan');
                 location.reload();
                 await new Promise(() => {});
@@ -1475,7 +1475,7 @@ PHP;
             await progress('main:entered');
             assert(hostileItem, 'hostile-content note was missing from the browser fixture');
             hostileItem.click();
-            const hostileNote = document.getElementById('phplet-note-http-note');
+            const hostileNote = document.getElementById('piplet-note-http-note');
             assert(!document.getElementById('css-pwn') && !document.body.dataset.pwned, 'stored custom CSS became executable markup');
             assert(hostileNote?.querySelector('.prose h3')?.textContent === 'Safe heading', 'note headings did not preserve the document outline');
             assert(hostileNote?.querySelector('.prose h4')?.textContent === 'Subheading' && hostileNote?.querySelector('.prose h5')?.textContent === 'Detail', 'nested note headings lost their semantic levels');
@@ -1515,7 +1515,7 @@ PHP;
             document.getElementById('appearance-form').requestSubmit();
             await until(() => !appearanceDialog.open, 'theme-only save did not finish');
             const afterTheme = await nativeFetch('?download=1').then(response => response.text());
-            assert(beforeTheme === afterTheme, 'theme-only save rewrote the phplet');
+            assert(beforeTheme === afterTheme, 'theme-only save rewrote the piplet');
             assert(appearanceCalls === 0, 'theme-only save called the shared appearance API');
 
             document.getElementById('appearance-button').click();
@@ -1547,7 +1547,7 @@ PHP;
             plum.checked = true;
             plum.dispatchEvent(new Event('input', {bubbles: true}));
             input(cssEditor, ':root { --story-width: 60rem; }\n.note-title { letter-spacing: 0; }\n</sty' + 'le><script id="css-pwn">1</scr' + 'ipt>');
-            assert(document.getElementById('phplet-custom-style').textContent === cssEditor.value, 'custom CSS preview was not applied as text');
+            assert(document.getElementById('piplet-custom-style').textContent === cssEditor.value, 'custom CSS preview was not applied as text');
             assert(!document.getElementById('css-pwn'), 'custom CSS escaped its style element');
             assert(getComputedStyle(document.documentElement).getPropertyValue('--story-width').trim() === '60rem', 'custom CSS lost cascade precedence');
             document.getElementById('appearance-form').requestSubmit();
@@ -1602,22 +1602,22 @@ PHP;
             window.fetch = nativeFetch;
 
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('phplet-composer'), 'the slug-collision note composer did not open');
+            await until(() => document.getElementById('piplet-composer'), 'the slug-collision note composer did not open');
             input(document.getElementById('edit-title'), 'new');
             input(document.getElementById('edit-body'), 'saved body for the real new slug');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.getElementById('phplet-note-new') && !document.querySelector('.editor'), 'a note whose slug is new did not save');
-            assert(document.querySelectorAll('#phplet-note-new').length === 1 && document.querySelectorAll('#note-count').length === 1,
+            await until(() => document.getElementById('piplet-note-new') && !document.querySelector('.editor'), 'a note whose slug is new did not save');
+            assert(document.querySelectorAll('#piplet-note-new').length === 1 && document.querySelectorAll('#note-count').length === 1,
                 'a saved note collided with a fixed page element ID');
             assert(/saved/i.test(document.getElementById('global-status').textContent)
                 && document.getElementById('global-status').textContent.includes('new'),
                 'the new-slug save notice was not contextual');
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit the real new-slug note');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit the real new-slug note');
             assert(document.getElementById('global-status').textContent === '', 'clicking into a note left the prior save notice visible');
-            await until(() => document.querySelector('#phplet-note-new.editor'), 'the real new-slug editor did not open');
+            await until(() => document.querySelector('#piplet-note-new.editor'), 'the real new-slug editor did not open');
             input(document.getElementById('edit-body'), 'unsaved body for the real new slug');
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('phplet-composer'), 'the distinct null-ID composer did not open');
+            await until(() => document.getElementById('piplet-composer'), 'the distinct null-ID composer did not open');
             const realNewDraftKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:new'));
             assert(realNewDraftKey && JSON.parse(sessionStorage.getItem(realNewDraftKey))?.id === 'new'
                 && JSON.parse(sessionStorage.getItem(realNewDraftKey))?.body === 'unsaved body for the real new slug',
@@ -1630,12 +1630,12 @@ PHP;
                 catch (_) { return false; }
             }, 'the null-ID composer did not use its separate recovery key');
             assert(JSON.parse(sessionStorage.getItem(realNewDraftKey))?.body === 'unsaved body for the real new slug'
-                && document.querySelectorAll('#phplet-note-new, #phplet-composer').length === 2,
+                && document.querySelectorAll('#piplet-note-new, #piplet-composer').length === 2,
                 'the composer overwrote the real new-slug draft or duplicated its DOM ID');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the separate composer did not cancel');
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'reopen the real new-slug note');
-            await until(() => document.querySelector('#phplet-note-new.editor'), 'the real new-slug recovery did not reopen');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'reopen the real new-slug note');
+            await until(() => document.querySelector('#piplet-note-new.editor'), 'the real new-slug recovery did not reopen');
             assert(document.getElementById('edit-body').value === 'unsaved body for the real new slug', 'the real new-slug draft did not round-trip');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the real new-slug recovery did not discard');
@@ -1644,8 +1644,8 @@ PHP;
                 id: null, baseRevision: 0, createToken: 'abababababababababababababababab',
                 title: 'Legacy composer', body: 'legacy null-ID body', tags: []
             }));
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit while a legacy null-ID draft owns draft:new');
-            await until(() => document.getElementById('phplet-composer'), 'editor entry did not prioritize the legacy null-ID draft');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while a legacy null-ID draft owns draft:new');
+            await until(() => document.getElementById('piplet-composer'), 'editor entry did not prioritize the legacy null-ID draft');
             assert(document.getElementById('edit-title').value === 'Legacy composer'
                 && document.getElementById('edit-body').value === 'legacy null-ID body',
                 'the old draft:new composer format was not read compatibly');
@@ -1666,19 +1666,19 @@ PHP;
                 id: null, baseRevision: 0, createToken: 'efefefefefefefefefefefefefefefef',
                 title: 'Independent legacy composer', body: 'keep this second', tags: []
             }));
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit while two composer recoveries coexist');
-            await until(() => document.getElementById('phplet-composer'), 'coexisting composer recovery did not open');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while two composer recoveries coexist');
+            await until(() => document.getElementById('piplet-composer'), 'coexisting composer recovery did not open');
             assert(document.getElementById('edit-title').value === 'Canonical composer', 'legacy migration overwrote the independent canonical composer');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'canonical composer recovery did not resolve');
             assert(sessionStorage.getItem(realNewDraftKey) !== null, 'resolving the canonical composer deleted its independent legacy peer');
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit after resolving the canonical composer');
-            await until(() => document.getElementById('phplet-composer'), 'the second composer recovery did not open');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit after resolving the canonical composer');
+            await until(() => document.getElementById('piplet-composer'), 'the second composer recovery did not open');
             assert(document.getElementById('edit-title').value === 'Independent legacy composer', 'the independent legacy composer did not drain second');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the independent legacy composer did not resolve');
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit the real new slug after draining composer recoveries');
-            await until(() => document.querySelector('#phplet-note-new.editor'), 'composer recovery keys still blocked the real new-slug note');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit the real new slug after draining composer recoveries');
+            await until(() => document.querySelector('#piplet-note-new.editor'), 'composer recovery keys still blocked the real new-slug note');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the real new-slug editor did not close after recovery drainage');
 
@@ -1690,8 +1690,8 @@ PHP;
                 id: 'new', baseRevision: 1, title: 'Cycle predecessor', body: 'older cycle text', tags: [],
                 previousDraftKeys: [composerDraftKey]
             }));
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit while recovery metadata contains a cycle');
-            await until(() => document.getElementById('phplet-composer'), 'cyclic recovery metadata hid every writable draft');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while recovery metadata contains a cycle');
+            await until(() => document.getElementById('piplet-composer'), 'cyclic recovery metadata hid every writable draft');
             assert(document.getElementById('edit-title').value === 'Cycle owner', 'cycle recovery did not prefer the canonical composer');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'cyclic recovery did not resolve');
@@ -1711,14 +1711,14 @@ PHP;
                 id: 'missing-cycle-b', baseRevision: 1, title: 'Disjoint cycle predecessor', body: 'older cyclic recovery', tags: [],
                 previousDraftKeys: [cycleAKey]
             }));
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit while an orphan cycle competes with a composer');
-            await until(() => document.getElementById('phplet-composer'), 'the independent composer did not open ahead of the orphan cycle');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while an orphan cycle competes with a composer');
+            await until(() => document.getElementById('piplet-composer'), 'the independent composer did not open ahead of the orphan cycle');
             assert(document.getElementById('edit-title').value === 'Independent before orphan cycle'
                 && JSON.parse(sessionStorage.getItem(cycleAKey))?.body === 'newer cyclic recovery',
                 'an orphan recovery cycle overwrote the independent composer destination');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the independent cycle-blocking composer did not resolve');
-            click(document.querySelector('#phplet-note-new button[title="Edit note"]'), 'edit after resolving the independent cycle-blocking composer');
+            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit after resolving the independent cycle-blocking composer');
             await until(() => document.querySelector('.conflict-panel')?.textContent.includes('deleted elsewhere'),
                 'the disjoint orphan cycle did not drain after its destination resolved');
             assert(['Disjoint cycle owner', 'Disjoint cycle predecessor'].includes(document.getElementById('edit-title').value),
@@ -1729,18 +1729,18 @@ PHP;
                 'discarding the disjoint recovery cycle left a hidden component');
 
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('phplet-composer'), 'the fixed-ID collision composer did not open');
+            await until(() => document.getElementById('piplet-composer'), 'the fixed-ID collision composer did not open');
             input(document.getElementById('edit-title'), 'count');
             input(document.getElementById('edit-body'), 'saved without colliding with note-count');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.getElementById('phplet-note-count') && !document.querySelector('.editor'), 'a note whose slug is count did not save');
+            await until(() => document.getElementById('piplet-note-count') && !document.querySelector('.editor'), 'a note whose slug is count did not save');
             assert(document.querySelectorAll('#note-count').length === 1
                 && document.getElementById('note-count').classList.contains('note-count'),
                 'a note slug collided with the fixed note-count element');
-            click(document.querySelector('#phplet-note-count button[title="Edit note"]'), 'edit the disposable count note');
-            await until(() => document.querySelector('#phplet-note-count.editor'), 'the disposable count editor did not open');
+            click(document.querySelector('#piplet-note-count button[title="Edit note"]'), 'edit the disposable count note');
+            await until(() => document.querySelector('#piplet-note-count.editor'), 'the disposable count editor did not open');
             button(document.querySelector('.editor-actions'), 'Delete').click();
-            await until(() => document.querySelector('#phplet-note-count .delete-row'), 'the disposable count delete confirmation did not open');
+            await until(() => document.querySelector('#piplet-note-count .delete-row'), 'the disposable count delete confirmation did not open');
             const nativeDeleteTimeout = window.setTimeout;
             let deleteStatusExpiry = null;
             window.setTimeout = function (callback, delay, ...args) {
@@ -1759,7 +1759,7 @@ PHP;
                 }
                 return nativeFetch(resource, options);
             };
-            button(document.querySelector('#phplet-note-count .delete-row'), 'Delete note').click();
+            button(document.querySelector('#piplet-note-count .delete-row'), 'Delete note').click();
             await until(() => releaseDelete !== null, 'the disposable delete was not held');
             const deletingStatus = document.getElementById('global-status').textContent;
             assert(/deleting/i.test(deletingStatus) && deletingStatus.includes('count'), 'the pending delete did not identify its note');
@@ -1768,7 +1768,7 @@ PHP;
             assert(document.getElementById('global-status').textContent === deletingStatus,
                 'ordinary interaction cleared a pending operation status');
             releaseDelete();
-            await until(() => !document.getElementById('phplet-note-count'), 'the disposable count note was not deleted');
+            await until(() => !document.getElementById('piplet-note-count'), 'the disposable count note was not deleted');
             window.fetch = nativeFetch;
             window.setTimeout = nativeDeleteTimeout;
             const deletedStatus = document.getElementById('global-status').textContent;
@@ -1903,14 +1903,14 @@ PHP;
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'fresh editor did not cancel');
 
-            const welcomeForConflict = await findLibraryItem('Hello, phplet');
+            const welcomeForConflict = await findLibraryItem('Hello, piplet');
             assert(welcomeForConflict, 'welcome was missing from the conflict library');
             welcomeForConflict.click();
-            await until(() => document.getElementById('phplet-note-welcome'), 'welcome did not open for conflict testing');
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'conflict welcome edit');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'welcome editor did not open');
+            await until(() => document.getElementById('piplet-note-welcome'), 'welcome did not open for conflict testing');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'conflict welcome edit');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'welcome editor did not open');
             input(document.getElementById('edit-body'), 'my conflicted draft');
-            const remote = await api('save', {id: 'welcome', baseRevision: 1, title: 'Hello, phplet', body: 'saved in another tab', tags: ['welcome']});
+            const remote = await api('save', {id: 'welcome', baseRevision: 1, title: 'Hello, piplet', body: 'saved in another tab', tags: ['welcome']});
             assert(remote.ok, 'competing save failed');
             const conflictSetItem = Storage.prototype.setItem;
             Storage.prototype.setItem = function (key, value) {
@@ -1925,31 +1925,31 @@ PHP;
             Storage.prototype.setItem = conflictSetItem;
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'conflict cancel did not close the editor');
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'reopen conflicted welcome');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'reopen conflicted welcome');
             await until(() => document.querySelector('.conflict-panel'), 'kept conflict draft was not recovered');
             assert(document.getElementById('edit-body').value === 'my conflicted draft', 'reopened conflict lost local text');
             button(document.querySelector('.conflict-panel'), 'Use saved version').click();
             await until(() => !document.querySelector('.editor'), 'using the saved version did not close the draft');
-            assert(document.querySelector('#phplet-note-welcome .prose').textContent.includes('saved in another tab'), 'saved version was not restored');
+            assert(document.querySelector('#piplet-note-welcome .prose').textContent.includes('saved in another tab'), 'saved version was not restored');
 
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'pristine welcome edit');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'pristine editor did not open');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'pristine welcome edit');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'pristine editor did not open');
             window.dispatchEvent(new Event('pagehide'));
             assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:welcome')), 'pagehide created a recovery draft for an untouched editor');
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('phplet-composer'), 'switching away from an untouched editor failed');
+            await until(() => document.getElementById('piplet-composer'), 'switching away from an untouched editor failed');
             assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:welcome')), 'switching notes created a false recovery draft');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'untouched new editor did not cancel');
 
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'ordinary cancel welcome edit');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'ordinary-cancel editor did not open');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'ordinary cancel welcome edit');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'ordinary-cancel editor did not open');
             input(document.getElementById('edit-body'), 'ordinary draft to discard');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'ordinary cancel did not close the editor');
             assert(!document.getElementById('global-status').textContent.includes('Draft kept'), 'ordinary cancel falsely claimed to keep its draft');
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'ordinary cancel welcome reopen');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'ordinary-cancel note did not reopen');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'ordinary cancel welcome reopen');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'ordinary-cancel note did not reopen');
             assert(document.getElementById('edit-body').value === 'saved in another tab', 'ordinary cancel retained discarded text');
             input(document.getElementById('edit-body'), 'draft whose removeItem fails');
             const originalRemoveItem = Storage.prototype.removeItem;
@@ -1960,14 +1960,14 @@ PHP;
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'second ordinary cancel did not close');
             Storage.prototype.removeItem = originalRemoveItem;
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'removeItem welcome reopen');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'removeItem-failure note did not reopen');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'removeItem welcome reopen');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'removeItem-failure note did not reopen');
             assert(document.getElementById('edit-body').value === 'saved in another tab', 'a failed removeItem resurrected discarded text');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'removeItem-failure editor did not close again');
 
-            click(document.querySelector('#phplet-note-welcome button[title="Edit note"]'), 'storage-failure welcome edit');
-            await until(() => document.querySelector('#phplet-note-welcome.editor'), 'storage-failure editor did not open');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'storage-failure welcome edit');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'storage-failure editor did not open');
             const originalSetItem = Storage.prototype.setItem;
             Storage.prototype.setItem = function (key, value) {
                 if (String(key).includes('draft:')) throw new DOMException('blocked', 'QuotaExceededError');
@@ -1998,13 +1998,13 @@ PHP;
             await until(() => document.querySelector('.editor-preview .render-notice'), 'node-heavy preview was not bounded');
             document.querySelector('.editor form').requestSubmit();
             await until(() => !document.querySelector('.editor'), 'bounded note save did not finish');
-            const welcome = document.getElementById('phplet-note-welcome');
+            const welcome = document.getElementById('piplet-note-welcome');
             assert(welcome.querySelector('.render-notice'), 'stored node-heavy note was not bounded');
             assert(welcome.querySelector('.plain-note').value === structured, 'bounded renderer did not retain complete text');
             assert(welcome.querySelectorAll('*').length < 250, 'bounded renderer created too many DOM nodes');
 
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('phplet-composer'), 'the remote-delete collision composer did not open');
+            await until(() => document.getElementById('piplet-composer'), 'the remote-delete collision composer did not open');
             input(document.getElementById('edit-title'), 'Independent composer before delete');
             input(document.getElementById('edit-body'), 'keep this independent composer');
             const deletedConflictItem = await findLibraryItem('One browser save');
@@ -2061,7 +2061,7 @@ PHP;
             await until(() => !document.querySelector('.editor'), 'deleted-note conflict did not discard');
 
             assert(runtimeErrors.length === 0, `page error before story-cap reload: ${runtimeErrors.join('; ')}`);
-            sessionStorage.setItem('phplet-browser-phase', 'story-cap');
+            sessionStorage.setItem('piplet-browser-phase', 'story-cap');
             await progress('main:reload-story-cap');
             location.reload();
             await new Promise(() => {});
@@ -2100,7 +2100,7 @@ PHP;
     check(file_put_contents($browserSignal, '') === 0, 'Could not initialize the browser completion signal.');
     [$server, $port] = start_test_server(
         $httpRoot,
-        test_environment(['PHPLET_ALLOW_PASSWORDLESS' => '1']),
+        test_environment(['PIPLET_ALLOW_PASSWORDLESS' => '1']),
         'Could not start the PHP test server.'
     );
     try {
@@ -2121,7 +2121,7 @@ PHP;
                 && !str_contains($csp, "'unsafe-inline'"),
             'The restrictive CSP contract changed.'
         );
-        check(preg_match('/name="phplet-csrf" content="([a-f0-9]{64})"/', $page, $tokenMatch) === 1, 'The CSRF token is missing.');
+        check(preg_match('/name="piplet-csrf" content="([a-f0-9]{64})"/', $page, $tokenMatch) === 1, 'The CSRF token is missing.');
         $setCookie = header_value($getHeaders, 'Set-Cookie');
         check($setCookie !== null && preg_match('/^([^=]+)=([^;]+)/', $setCookie, $cookieMatch) === 1, 'The CSRF cookie is missing.');
         $token = $tokenMatch[1];
@@ -2179,14 +2179,14 @@ PHP;
         foreach (array_diff_key($httpAppearanceValues, ['customCss' => true]) as $name => $value) {
             check(str_contains($appearanceHtml, 'data-' . $name . '="' . $value . '"'), "The saved $name appearance was not rendered on reload.");
         }
-        check(str_contains($appearancePage, '<style nonce=') && str_contains($appearancePage, 'id="phplet-custom-style"></style>'), 'The custom CSS module is not structurally empty.');
+        check(str_contains($appearancePage, '<style nonce=') && str_contains($appearancePage, 'id="piplet-custom-style"></style>'), 'The custom CSS module is not structurally empty.');
         check(!str_contains($appearancePage, '</style><script id="css-pwn">'), 'Custom CSS was interpolated into live HTML.');
-        check(preg_match('/<script type="application\/json" id="phplet-state"[^>]*>(.*?)<\/script>/s', $appearancePage, $stateMatch) === 1, 'The appearance state block is missing.');
+        check(preg_match('/<script type="application\/json" id="piplet-state"[^>]*>(.*?)<\/script>/s', $appearancePage, $stateMatch) === 1, 'The appearance state block is missing.');
         $appearanceState = json_decode($stateMatch[1], true, 32, JSON_THROW_ON_ERROR);
         check($appearanceState['appearance']['customCss'] === $hostileCss && $appearanceState['safeAppearance'] === false, 'Custom CSS did not round-trip through the inert state block.');
         [$safeStatus, , $safePage] = http_request("http://127.0.0.1:$port/?safe=1", 'GET', ["Cookie: $cookie"]);
         check($safeStatus === 200 && str_contains($safePage, 'Custom CSS is off for this page.'), 'Safe appearance mode is unavailable.');
-        check(preg_match('/<script type="application\/json" id="phplet-state"[^>]*>(.*?)<\/script>/s', $safePage, $safeStateMatch) === 1, 'Safe mode lost the appearance state block.');
+        check(preg_match('/<script type="application\/json" id="piplet-state"[^>]*>(.*?)<\/script>/s', $safePage, $safeStateMatch) === 1, 'Safe mode lost the appearance state block.');
         $safeState = json_decode($safeStateMatch[1], true, 32, JSON_THROW_ON_ERROR);
         check($safeState['safeAppearance'] === true && $safeState['appearance']['customCss'] === $hostileCss, 'Safe mode erased the editable CSS instead of only disabling it.');
         $appearanceHash = hash_file('sha256', $httpCopy);
@@ -2282,7 +2282,7 @@ PHP;
             check(str_contains($httpSource, 'recoverReadOnlyDraft'), 'The read-only draft recovery guard is missing.');
             check(str_contains($httpSource, 'const maxOpenNotes = 20;') && str_contains($httpSource, 'const maxLibraryNotes = 40;'), 'The aggregate rendering guards are missing.');
             check(str_contains($httpSource, "id === null ? '@new' : id") && str_contains($httpSource, "draft.id !== null && draft.id !== 'new'"), 'The null-ID draft namespace or legacy migration guard is missing.');
-            check(str_contains($httpSource, 'article.id = editor.id === null ? \'phplet-composer\' : `phplet-note-${editor.id}`;'), 'Saved notes and the composer no longer have separate DOM namespaces.');
+            check(str_contains($httpSource, 'article.id = editor.id === null ? \'piplet-composer\' : `piplet-note-${editor.id}`;'), 'Saved notes and the composer no longer have separate DOM namespaces.');
             check(str_contains($httpSource, "els['drawer-shade'].tabIndex = -1;") && !str_contains($httpSource, ", els['drawer-shade']];"), 'The modal drawer focus guard includes its outside backdrop.');
             check(str_contains($httpSource, "boot.safeAppearance ? '' : values.customCss"), 'The safe-mode custom CSS guard is missing.');
             fwrite(STDOUT, "skip — Chrome unavailable; dynamic browser regressions were not run\n");
@@ -2316,7 +2316,7 @@ PHP;
     $authRoot = dirname($authCopy);
     [$authServer, $authPort] = start_test_server(
         $authRoot,
-        test_environment(['PHPLET_PASSWORD' => 'correct horse battery staple']),
+        test_environment(['PIPLET_PASSWORD' => 'correct horse battery staple']),
         'Could not start the authenticated test server.'
     );
     try {
@@ -2329,7 +2329,7 @@ PHP;
         [$wrongStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic ' . base64_encode('writer:wrong')]);
         check($wrongStatus === 401, 'Password mode accepted a wrong password.');
         [$wrongApiStatus] = http_request("http://127.0.0.1:$authPort/?api=delete", 'POST', ['Authorization: Basic ' . base64_encode('writer:wrong'), 'Content-Type: application/json'], '{}');
-        check($wrongApiStatus === 401 && hash_file('sha256', $authRoot . '/index.php') === $authHash, 'Wrong-password API access changed the protected phplet.');
+        check($wrongApiStatus === 401 && hash_file('sha256', $authRoot . '/index.php') === $authHash, 'Wrong-password API access changed the protected piplet.');
         [$correctStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic ' . base64_encode('writer:correct horse battery staple')]);
         check($correctStatus === 200, 'Password mode rejected the configured password.');
         [$lowercaseStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: basic ' . base64_encode('writer:correct horse battery staple')]);
@@ -2340,7 +2340,7 @@ PHP;
         stop_test_server($authServer, 'authenticated');
     }
 
-    check(hash_file('sha256', $source) === $sourceHashBefore, 'The test runner changed the source phplet.');
+    check(hash_file('sha256', $source) === $sourceHashBefore, 'The test runner changed the source piplet.');
     $successMessage = sprintf("ok — %d assertions; source file untouched; 7+ MiB cycle %.2fs (worker peak %.1f MiB)\n", $assertions, $largeElapsed, $largePeak / 1024 / 1024);
 } catch (Throwable $error) {
     fwrite(STDERR, "not ok — {$error->getMessage()}\n");
@@ -2365,7 +2365,7 @@ PHP;
         }
     }
     if ($sourceHashBefore !== false && hash_file('sha256', $source) !== $sourceHashBefore) {
-        fwrite(STDERR, "not ok — source phplet changed during tests\n");
+        fwrite(STDERR, "not ok — source piplet changed during tests\n");
         $exitStatus = 1;
     }
 }
