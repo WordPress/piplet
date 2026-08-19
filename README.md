@@ -11,8 +11,6 @@ piplet.php
 └── { versioned JSON notes and appearance }
 ```
 
-The browser edits one note at a time and shows a live preview. Save rewrites only the JSON snapshot; the executable prefix is copied byte for byte. Readers see either the complete old file or the complete new file.
-
 ## Run it
 
 PHP 8.1 or newer is required.
@@ -69,17 +67,17 @@ The inode retry is the small but important detail that allows one durable filesy
 
 Stored note text is never evaluated as PHP and is added to the page with DOM text nodes. The JSON embedded in HTML uses the `JSON_HEX_*` escapes, mutations require JSON plus a same-origin CSRF header/cookie pair, and the response ships a restrictive Content Security Policy.
 
-## Honest limits
+## Limits
 
-- Supported deployment: PHP 8.1+ on a local POSIX filesystem. NFS/SMB, multi-host writers, serverless/immutable filesystems, hard-linked aliases, and Windows have not been claimed or tested.
-- The whole file is copied on every save. The configured ceiling is 8 MiB; a few megabytes is the intended scale, not a busy multi-user site.
-- Rendering is deliberately bounded: the story keeps at most 20 open notes and the index shows the newest 40 matches. Search still reaches older notes.
+- Supported deployment: PHP 8.1+ on a local POSIX filesystem. NFS/SMB, multi-host writers, serverless/immutable filesystems, hard-linked aliases, and Windows have not been tested.
+- The whole file is copied on every save. The configured ceiling is 8 MiB.
+- Rendering is bounded: the story keeps at most 20 open notes and the index shows the newest 40 matches. Search still reaches older notes.
 - The containing directory is briefly home to one high-entropy temporary `.php` file during a save. It starts at mode `0600`, is removed on handled failure, and is renamed on success. A hard process kill at any point after temporary-file creation can leave a hidden orphan; after verifying the canonical piplet, that orphan can be deleted.
 - Atomic rename prevents torn reads and `fsync` protects the temporary contents, but portable PHP cannot `fsync` the containing directory. A sudden power loss can lose the latest rename even though it will not expose a half-written canonical file.
 - Atomic replacement can change ownership to the PHP process and does not preserve ACLs or extended attributes. Ordinary permission bits are preserved.
 - A web-writable PHP file is intentionally unusual. Keep backups and do not deploy it where policy or hardening rules forbid self-modifying code.
 
-## Unsafe teaching version
+## Unsafe simple version
 
 [`piplet-unsafe.php`](piplet-unsafe.php) keeps only the core trick: multiple reading pages, a separate editor with live preview, and JSON after `__halt_compiler()`. It rewrites itself directly. It has no authentication, CSRF protection, validation, atomic replacement, crash recovery, or conflict handling. Keep it on loopback, use a disposable copy, and keep a backup.
 
