@@ -187,7 +187,7 @@ function worker_main(array $arguments): never
             'large-output' => str_repeat('x', 1024 * 1024),
             'json-length' => [
                 'projected' => piplet_json_encoded_length($input['value'] ?? null),
-                'actual' => strlen(json_encode($input['value'] ?? null, piplet_json_flags())),
+                'actual' => strlen(json_encode($input['value'] ?? null, PIPLET_JSON_FLAGS)),
             ],
             'temp-info' => worker_temp_info($input),
             'inject-appearance' => worker_inject_appearance($input),
@@ -427,7 +427,7 @@ function worker_import_data(array $input): array
 {
     $source = $input['source'] ?? null;
     if (!is_string($source)) throw new RuntimeException('Import source missing.');
-    return piplet_replace_document(piplet_read_snapshot_data($source), true);
+    return piplet_replace_document(piplet_read_snapshot_data($source));
 }
 
 function worker_command(string $target, string $action, array $input = []): array|string|bool
