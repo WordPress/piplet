@@ -1,6 +1,12 @@
 <?php
 declare(strict_types=1);
 
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    header('Content-Type: text/plain; charset=utf-8');
+    exit("Not found.\n");
+}
+
 /* A dependency-free black-box test runner. The source piplet is never mutated. */
 
 if (($argv[1] ?? '') === '--worker') {
@@ -30,8 +36,9 @@ function check(bool $condition, string $message): void
 function make_fixture(string $source, string $destination): bool
 {
     $raw = @file_get_contents($source);
+    $sourceMarker = "\nPIPLET-DATA/2\n";
     $marker = "\nPIPLET-DATA/1\n";
-    $markerAt = is_string($raw) ? strpos($raw, $marker) : false;
+    $markerAt = is_string($raw) ? strrpos($raw, $sourceMarker) : false;
     if ($markerAt === false || !@copy($source, $destination)) return false;
 
     $document = [
@@ -641,7 +648,9 @@ try {
     $temporaryRootIdentity = lstat($temporaryRoot);
     check(is_array($temporaryRootIdentity), 'Could not identify the test directory.');
     $liveDocument = worker_command($source, 'read');
-    check(($liveDocument['format'] ?? null) === 1, 'The live piplet data cannot be read.');
+    check(($liveDocument['format'] ?? null) === 2
+        && preg_match('/^[a-f0-9]{32}$/D', $liveDocument['generation'] ?? '') === 1,
+        'The live piplet data cannot be read as the current format.');
     check(make_fixture($source, $copy), 'Could not make an isolated test copy.');
 
     $initialLint = run_bounded_command([PHP_BINARY, '-l', $copy]);

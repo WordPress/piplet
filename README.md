@@ -97,3 +97,7 @@ php tests/unsafe-run.php
 ```
 
 It covers CRUD, idempotent creates, appearance and legacy-token migration, stale revisions, private temporary files, hostile/Unicode text and CSS, immutable-prefix preservation, PHP linting after saves, HTTP/auth/CSRF behavior, multi-megabyte snapshots, and concurrent writers queued across inode replacements. When Chrome or Chromium is available, it also runs real browser regressions for held/double saves, conflict and read-only draft recovery, unavailable browser storage, bounded story/index rendering, theme-only saves, full CSS previews, safe appearance mode, and mobile focus. Without Chrome, the runner reports that those dynamic browser scenarios were skipped and performs only static guard checks for their critical code paths.
+
+## License
+
+piplet is available under the [MIT License](LICENSE).
