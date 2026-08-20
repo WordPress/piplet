@@ -18,11 +18,13 @@ $source = $root . '/piplet.php';
 $temporaryRoot = sys_get_temp_dir() . '/piplet-tests-' . bin2hex(random_bytes(6));
 $copy = $temporaryRoot . '/index.php';
 $sourceHashBefore = is_file($source) ? hash_file('sha256', $source) : false;
+$runnerHashBefore = hash_file('sha256', __FILE__);
 $assertions = 0;
 $liveWorkers = [];
 $successMessage = null;
 $temporaryRootOwned = false;
 $temporaryRootIdentity = null;
+$defaultHttpHeaders = [];
 
 function check(bool $condition, string $message): void
 {
@@ -30,6 +32,30 @@ function check(bool $condition, string $message): void
     $assertions++;
     if (!$condition) {
         throw new RuntimeException($message);
+    }
+}
+
+final class PipletShortWriteStream
+{
+    public mixed $context;
+    public static string $written = '';
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$openedPath): bool
+    {
+        self::$written = '';
+        return true;
+    }
+
+    public function stream_write(string $data): int
+    {
+        $chunk = substr($data, 0, 7);
+        self::$written .= $chunk;
+        return strlen($chunk);
+    }
+
+    public function stream_stat(): array
+    {
+        return [];
     }
 }
 
@@ -68,6 +94,36 @@ function fixture_copy(string $root, string $source, string $name, string $failur
     return $destination;
 }
 
+function replace_fixture_trailer(string $path, string $marker, string $json): bool
+{
+    $raw = file_get_contents($path);
+    if (!is_string($raw)) return false;
+    $positions = array_filter([
+        strrpos($raw, "\nPIPLET-DATA/1\n"),
+        strrpos($raw, "\nPIPLET-DATA/2\n"),
+    ], static fn ($position): bool => $position !== false);
+    if ($positions === []) return false;
+    $snapshot = substr($raw, 0, max($positions)) . $marker . $json . "\n";
+    return file_put_contents($path, $snapshot) === strlen($snapshot);
+}
+
+function fixture_document_object(string $path): stdClass
+{
+    $raw = file_get_contents($path);
+    if (!is_string($raw)) throw new RuntimeException('Could not read fixture JSON.');
+    $positions = array_filter([
+        strrpos($raw, "\nPIPLET-DATA/1\n"),
+        strrpos($raw, "\nPIPLET-DATA/2\n"),
+    ], static fn ($position): bool => $position !== false);
+    if ($positions === []) throw new RuntimeException('Fixture data marker is missing.');
+    $markerAt = max($positions);
+    $lineEnd = strpos($raw, "\n", $markerAt + 1);
+    $json = $lineEnd === false ? '' : trim(substr($raw, $lineEnd + 1));
+    $decoded = json_decode($json, false, 64, JSON_THROW_ON_ERROR);
+    if (!$decoded instanceof stdClass) throw new RuntimeException('Fixture data is not an object.');
+    return $decoded;
+}
+
 function css_theme_tokens(string $source, string $selector): array
 {
     $quoted = preg_quote($selector, '/');
@@ -96,11 +152,26 @@ function worker_main(array $arguments): never
     $target = $arguments[2] ?? '';
     $action = $arguments[3] ?? '';
     $encoded = $arguments[4] ?? '';
+    $realTarget = realpath($target);
+    $realSource = realpath(dirname(__DIR__) . '/piplet.php');
+    $workerRoot = realpath((string) getenv('PIPLET_TEST_ROOT'));
+    $targetStat = $realTarget === false ? false : lstat($realTarget);
+    $allowedTarget = is_string($realTarget) && is_array($targetStat)
+        && (((int) $targetStat['mode']) & 0170000) === 0100000
+        && ($realTarget === $realSource ? $action === 'read' : is_string($workerRoot)
+            && str_starts_with($realTarget, $workerRoot . DIRECTORY_SEPARATOR));
+    if (!$allowedTarget) {
+        fwrite(STDERR, "Worker target rejected.\n");
+        exit(2);
+    }
     define('PIPLET_LIBRARY_ONLY', true);
-    require $target;
+    require $realTarget;
 
     try {
         $input = $encoded === '' ? [] : json_decode(base64_decode($encoded, true), true, 16, JSON_THROW_ON_ERROR);
+        if (in_array($action, ['save', 'delete', 'appearance'], true)) {
+            $input = worker_api_input($action, $input);
+        }
         $result = match ($action) {
             'read' => piplet_read(),
             'save' => piplet_save_note($input),
@@ -110,14 +181,23 @@ function worker_main(array $arguments): never
             'prefix' => hash('sha256', substr(file_get_contents(piplet_path()), 0, piplet_code_offset())),
             'held-save' => worker_held_save($input),
             'large-save' => worker_large_save($input),
+            'exact-file-save' => worker_exact_file_save(),
             'summary' => worker_summary(),
             'seed-notes' => worker_seed_notes($input),
             'large-output' => str_repeat('x', 1024 * 1024),
+            'json-length' => [
+                'projected' => piplet_json_encoded_length($input['value'] ?? null),
+                'actual' => strlen(json_encode($input['value'] ?? null, piplet_json_flags())),
+            ],
             'temp-info' => worker_temp_info($input),
             'inject-appearance' => worker_inject_appearance($input),
             'duplicate-token' => worker_duplicate_token(),
             'numeric-id' => worker_numeric_id(),
             'cookie-path' => piplet_cookie_path((string) ($input['script'] ?? '/')),
+            'authorization-password' => worker_authorization_password($input),
+            'request-is-https' => worker_request_is_https($input),
+            'short-write' => worker_short_write(),
+            'import-data' => worker_import_data($input),
             default => throw new RuntimeException('Unknown worker action.'),
         };
         fwrite(STDOUT, json_encode(['ok' => true, 'value' => $result], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE));
@@ -126,14 +206,32 @@ function worker_main(array $arguments): never
         fwrite(STDOUT, json_encode(['ok' => false, 'conflict' => true, 'current' => $error->current], JSON_THROW_ON_ERROR));
         exit(3);
     } catch (Throwable $error) {
-        fwrite(STDERR, $error::class . ': ' . $error->getMessage() . PHP_EOL);
+        fwrite(STDERR, "$action " . json_encode($input ?? []) . ': ' . $error::class . ': ' . $error->getMessage() . PHP_EOL);
         exit(2);
     }
 }
 
+function worker_api_input(string $action, array $input): array
+{
+    $document = piplet_read();
+    $input['baseGeneration'] ??= $document['generation'];
+    if ($action === 'appearance') {
+        $appearance = piplet_current_appearance($document);
+        $input['baseVersion'] ??= $appearance['version'];
+        return $input;
+    }
+    $id = $input['id'] ?? null;
+    $note = is_string($id) ? ($document['notes'][$id] ?? null) : null;
+    $input['baseVersion'] ??= is_array($note) ? $note['version'] : null;
+    if ($action === 'save') {
+        $input['createToken'] ??= $id === null ? bin2hex(random_bytes(16)) : null;
+    }
+    return $input;
+}
+
 function worker_held_save(array $input): array
 {
-    $hold = max(0, min(500000, (int) ($input['hold'] ?? 0)));
+    $hold = max(0, min(3000000, (int) ($input['hold'] ?? 0)));
     $title = (string) ($input['title'] ?? 'Concurrent note');
     return piplet_mutate(function (array &$document) use ($hold, $title): array {
         if ($hold > 0) {
@@ -147,6 +245,7 @@ function worker_held_save(array $input): array
             'body' => 'Written by a concurrent worker.',
             'tags' => ['concurrency'],
             'revision' => $document['revision'] + 1,
+            'version' => piplet_version(),
             'created' => $now,
             'updated' => $now,
         ];
@@ -159,13 +258,13 @@ function worker_large_save(array $input): array
 {
     $bytes = max(0, (int) ($input['bytes'] ?? 0));
     $id = isset($input['id']) && is_string($input['id']) ? $input['id'] : null;
-    $saved = piplet_save_note([
+    $saved = piplet_save_note(worker_api_input('save', [
         'id' => $id,
         'baseRevision' => (int) ($input['baseRevision'] ?? 0),
         'title' => (string) ($input['title'] ?? 'Large note'),
         'body' => str_repeat((string) ($input['character'] ?? 'x'), $bytes),
         'tags' => ['large'],
-    ]);
+    ]));
     return [
         'id' => $saved['result']['id'],
         'noteRevision' => $saved['result']['revision'],
@@ -184,6 +283,25 @@ function worker_summary(): array
     ];
 }
 
+function worker_exact_file_save(): array
+{
+    $saved = piplet_mutate(function (array &$document): array {
+        $now = piplet_now();
+        $document['notes']['welcome']['body'] = '';
+        $document['notes']['welcome']['revision'] = $document['revision'] + 1;
+        $document['notes']['welcome']['version'] = piplet_version();
+        $document['notes']['welcome']['updated'] = $now;
+        $projected = $document;
+        $projected['revision']++;
+        $padding = PIPLET_MAX_FILE_BYTES - piplet_code_offset() - strlen(PIPLET_DATA_HEADER) - 1
+            - piplet_json_encoded_length($projected);
+        if ($padding < 0) throw new RuntimeException('The exact-limit fixture has no room for padding.');
+        $document['notes']['welcome']['body'] = str_repeat('x', $padding);
+        return ['bodyBytes' => $padding];
+    });
+    return ['bytes' => $saved['bytes'], 'bodyBytes' => $saved['result']['bodyBytes']];
+}
+
 function worker_seed_notes(array $input): array
 {
     $count = max(0, min(100, (int) ($input['count'] ?? 0)));
@@ -197,6 +315,7 @@ function worker_seed_notes(array $input): array
                 'body' => "A bounded note $index.",
                 'tags' => ['cap'],
                 'revision' => $document['revision'] + 1,
+                'version' => piplet_version(),
                 'created' => $now,
                 'updated' => $now,
             ];
@@ -228,7 +347,11 @@ function worker_temp_info(array $input): array
 function worker_inject_appearance(array $input): array
 {
     return piplet_mutate(function (array &$document) use ($input): array {
-        $document['appearance'] = ['revision' => $document['revision'] + 1, ...$input];
+        $document['appearance'] = [
+            'revision' => $document['revision'] + 1,
+            'version' => piplet_version(),
+            ...$input,
+        ];
         return $document['appearance'];
     });
 }
@@ -241,6 +364,7 @@ function worker_duplicate_token(): array
             $document['notes'][$id] = [
                 'id' => $id, 'title' => $id, 'body' => '', 'tags' => [],
                 'revision' => $document['revision'] + 1,
+                'version' => piplet_version(),
                 'created' => $now, 'updated' => $now,
                 'createToken' => str_repeat('e', 32),
             ];
@@ -255,13 +379,58 @@ function worker_numeric_id(): array
         $document['notes']['01'] = [
             'id' => '01', 'title' => 'Numeric identifier', 'body' => '', 'tags' => [],
             'revision' => $document['revision'] + 1,
+            'version' => piplet_version(),
             'created' => piplet_now(), 'updated' => piplet_now(),
         ];
         return [];
     });
 }
 
-function worker_command(string $target, string $action, array $input = []): array|string
+function worker_authorization_password(array $input): string
+{
+    unset($_SERVER['PHP_AUTH_PW'], $_SERVER['HTTP_AUTHORIZATION'], $_SERVER['REDIRECT_HTTP_AUTHORIZATION']);
+    foreach (['PHP_AUTH_PW' => 'phpAuth', 'HTTP_AUTHORIZATION' => 'authorization',
+        'REDIRECT_HTTP_AUTHORIZATION' => 'redirectAuthorization'] as $serverKey => $inputKey) {
+        if (array_key_exists($inputKey, $input)) $_SERVER[$serverKey] = $input[$inputKey];
+    }
+    return piplet_provided_password();
+}
+
+function worker_request_is_https(array $input): bool
+{
+    unset($_SERVER['HTTPS']);
+    if (array_key_exists('https', $input)) $_SERVER['HTTPS'] = $input['https'];
+    putenv('PIPLET_PUBLIC_HTTPS=' . (($input['public'] ?? false) ? '1' : '0'));
+    return piplet_request_is_https();
+}
+
+function worker_short_write(): bool
+{
+    $scheme = 'pipletshort';
+    if (!stream_wrapper_register($scheme, PipletShortWriteStream::class)) {
+        throw new RuntimeException('Could not register the short-write stream.');
+    }
+    $handle = null;
+    try {
+        $handle = fopen("$scheme://test", 'wb');
+        if ($handle === false) throw new RuntimeException('Could not open the short-write stream.');
+        $payload = str_repeat('short-write-', 10000);
+        piplet_write_all($handle, $payload);
+        return PipletShortWriteStream::$written === $payload;
+    } finally {
+        if (is_resource($handle)) fclose($handle);
+        stream_wrapper_unregister($scheme);
+    }
+}
+
+function worker_import_data(array $input): array
+{
+    $source = $input['source'] ?? null;
+    if (!is_string($source)) throw new RuntimeException('Import source missing.');
+    return piplet_replace_document(piplet_read_snapshot_data($source), true);
+}
+
+function worker_command(string $target, string $action, array $input = []): array|string|bool
 {
     $decoded = finish_worker(start_worker($target, $action, $input));
     return $decoded['value'];
@@ -274,15 +443,21 @@ function worker_conflict(string $target, string $action, array $input): array
 
 function start_worker(string $target, string $action, array $input, ?array $environment = null): array
 {
-    global $liveWorkers;
-    $command = [PHP_BINARY, __FILE__, '--worker', $target, $action, base64_encode(json_encode($input, JSON_THROW_ON_ERROR))];
+    global $liveWorkers, $temporaryRoot;
+    if ($environment === null) {
+        $environment = getenv();
+        $environment = is_array($environment) ? $environment : [];
+    }
+    $environment['PIPLET_TEST_ROOT'] = $temporaryRoot;
+    $command = [PHP_BINARY, '-d', 'memory_limit=128M', __FILE__, '--worker', $target, $action,
+        base64_encode(json_encode($input, JSON_THROW_ON_ERROR))];
     $pipes = [];
     $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $environment);
     if (!is_resource($process)) {
         throw new RuntimeException('Could not start a concurrent worker.');
     }
     fclose($pipes[0]);
-    $worker = [$process, $pipes, microtime(true) + 10];
+    $worker = [$process, $pipes, microtime(true) + 10, $action];
     $liveWorkers[get_resource_id($process)] = $worker;
     return $worker;
 }
@@ -290,7 +465,7 @@ function start_worker(string $target, string $action, array $input, ?array $envi
 function finish_worker(array $worker, int $expectedStatus = 0): array
 {
     global $liveWorkers;
-    [$process, $pipes, $deadline] = $worker;
+    [$process, $pipes, $deadline, $action] = $worker;
     $resourceId = get_resource_id($process);
     $lastStatus = null;
     $stdout = '';
@@ -315,8 +490,8 @@ function finish_worker(array $worker, int $expectedStatus = 0): array
         if ($stopped) proc_close($process);
         unset($liveWorkers[$resourceId]);
         throw new RuntimeException($stopped
-            ? 'A worker exceeded its 10 second deadline.'
-            : 'A worker exceeded its deadline and could not be terminated.');
+            ? "Worker $action exceeded its 10 second deadline."
+            : "Worker $action exceeded its deadline and could not be terminated.");
     }
     $stdout .= stream_get_contents($pipes[1]);
     $stderr .= stream_get_contents($pipes[2]);
@@ -331,7 +506,33 @@ function finish_worker(array $worker, int $expectedStatus = 0): array
     if ($stdout === '') {
         return ['ok' => false, 'stderr' => $stderr];
     }
-    return json_decode($stdout, true, 32, JSON_THROW_ON_ERROR);
+    try {
+        return json_decode($stdout, true, 32, JSON_THROW_ON_ERROR);
+    } catch (JsonException $error) {
+        throw new RuntimeException("Worker $action returned invalid JSON: $stdout\n$stderr", 0, $error);
+    }
+}
+
+function kill_worker(array $worker): void
+{
+    global $liveWorkers;
+    [$process, $pipes, , $action] = $worker;
+    $resourceId = get_resource_id($process);
+    $status = proc_get_status($process);
+    if (!$status['running'] || !@proc_terminate($process, 9)) {
+        throw new RuntimeException("Worker $action was not running at its crash checkpoint.");
+    }
+    $deadline = microtime(true) + 2;
+    do {
+        usleep(10000);
+        $status = proc_get_status($process);
+    } while ($status['running'] && microtime(true) < $deadline);
+    foreach ($pipes as $pipe) if (is_resource($pipe)) fclose($pipe);
+    if ($status['running']) {
+        throw new RuntimeException("Worker $action did not stop after SIGKILL.");
+    }
+    proc_close($process);
+    unset($liveWorkers[$resourceId]);
 }
 
 function free_port(): int
@@ -349,6 +550,8 @@ function free_port(): int
 
 function http_request(string $url, string $method = 'GET', array $headers = [], string $body = ''): array
 {
+    global $defaultHttpHeaders;
+    $headers = [...$defaultHttpHeaders, ...$headers];
     $options = ['http' => [
         'method' => $method,
         'header' => implode("\r\n", $headers),
@@ -362,15 +565,33 @@ function http_request(string $url, string $method = 'GET', array $headers = [], 
     return [$status, $responseHeaders, $responseBody === false ? '' : $responseBody];
 }
 
-function wait_for_server(int $port): void
+function page_state(string $html): array
 {
+    check(preg_match('/<script type="application\/octet-stream" id="piplet-state"[^>]*>([A-Za-z0-9+\/=\s]+)<\/script>/s', $html, $match) === 1,
+        'The base64 state block is missing.');
+    $json = base64_decode(trim($match[1]), true);
+    check(is_string($json) && !str_contains(trim($match[1]), '<'), 'The state block was not valid non-HTML base64.');
+    return json_decode($json, true, 32, JSON_THROW_ON_ERROR);
+}
+
+function wait_for_server($process, int $port, string $log): void
+{
+    $deadline = microtime(true) + 2;
     for ($attempt = 0; $attempt < 50; $attempt++) {
-        $socket = @fsockopen('127.0.0.1', $port, $errorCode, $errorMessage, .1);
-        if (is_resource($socket)) {
-            fclose($socket);
-            return;
+        $status = proc_get_status($process);
+        $output = @file_get_contents($log);
+        if (!$status['running']) {
+            throw new RuntimeException('The PHP test server exited before binding its port. ' . trim((string) $output));
+        }
+        if (is_string($output) && str_contains($output, 'Development Server') && str_contains($output, 'started')) {
+            $socket = @fsockopen('127.0.0.1', $port, $errorCode, $errorMessage, .1);
+            if (is_resource($socket)) {
+                fclose($socket);
+                return;
+            }
         }
         usleep(20000);
+        if (microtime(true) >= $deadline) break;
     }
     throw new RuntimeException('The PHP test server did not start.');
 }
@@ -379,17 +600,18 @@ function test_environment(array $set = []): array
 {
     $environment = getenv();
     $environment = is_array($environment) ? $environment : [];
-    unset($environment['PIPLET_PASSWORD'], $environment['PIPLET_ALLOW_PASSWORDLESS']);
+    unset($environment['PIPLET_PASSWORD'], $environment['PIPLET_ALLOW_PASSWORDLESS'], $environment['PIPLET_PUBLIC_HTTPS']);
     return [...$environment, ...$set];
 }
 
-function start_test_server(string $root, array $environment, string $failure): array
+function start_test_server(string $root, array $environment, string $failure, ?int $selectedPort = null): array
 {
-    $port = free_port();
+    $port = $selectedPort ?? free_port();
+    $log = $root . '/.piplet-server-' . bin2hex(random_bytes(8)) . '.log';
     $pipes = [];
     $process = proc_open(
         [PHP_BINARY, '-S', "127.0.0.1:$port", '-t', $root],
-        [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']],
+        [0 => ['pipe', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', $log, 'a']],
         $pipes,
         $root,
         $environment
@@ -397,7 +619,7 @@ function start_test_server(string $root, array $environment, string $failure): a
     check(is_resource($process), $failure);
     fclose($pipes[0]);
     try {
-        wait_for_server($port);
+        wait_for_server($process, $port, $log);
     } catch (Throwable $error) {
         if (terminate_process($process, 1.0)) proc_close($process);
         throw $error;
@@ -460,10 +682,11 @@ function terminate_process($process, float $seconds = 1.0): bool
     return false;
 }
 
-function run_bounded_command(array $command, float $seconds = 5.0): array
+function run_bounded_command(array $command, float $seconds = 5.0, ?array $environment = null): array
 {
     $pipes = [];
-    $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes,
+        null, $environment);
     if (!is_resource($process)) throw new RuntimeException('Could not start a subprocess.');
     fclose($pipes[0]);
     stream_set_blocking($pipes[1], false);
@@ -662,18 +885,306 @@ try {
         $timeoutObserved = str_contains($error->getMessage(), 'deadline');
     }
     check($timeoutObserved, 'The bounded subprocess runner did not enforce its deadline.');
+    $foreignWorker = run_bounded_command([
+        PHP_BINARY, __FILE__, '--worker', '/etc/passwd', 'read', base64_encode('[]'),
+    ]);
+    check($foreignWorker['status'] === 2 && trim($foreignWorker['stderr']) === 'Worker target rejected.'
+        && $foreignWorker['stdout'] === '',
+        'The internal worker accepted an arbitrary executable target.');
+
+    $occupiedPortError = 0;
+    $occupiedPortMessage = '';
+    $occupiedPort = stream_socket_server('tcp://127.0.0.1:0', $occupiedPortError, $occupiedPortMessage);
+    check(is_resource($occupiedPort), 'Could not reserve a port for the server-ownership test.');
+    $occupiedAddress = stream_socket_get_name($occupiedPort, false);
+    $occupiedNumber = (int) substr(strrchr((string) $occupiedAddress, ':'), 1);
+    $occupiedRejected = false;
+    try {
+        start_test_server($temporaryRoot, test_environment(), 'Could not start the collision test server.', $occupiedNumber);
+    } catch (RuntimeException $error) {
+        $occupiedRejected = str_contains($error->getMessage(), 'exited before binding');
+    } finally {
+        fclose($occupiedPort);
+    }
+    check($occupiedRejected, 'Server readiness accepted a different process that already owned the selected port.');
 
     $prefixBefore = worker_command($copy, 'prefix');
     $initial = worker_command($copy, 'read');
-    check($initial['format'] === 1, 'Unexpected data format.');
+    check($initial['format'] === 2 && isset($initial['generation']), 'Unexpected data format.');
     check($initial['revision'] === 1, 'Unexpected initial document revision.');
     check(isset($initial['notes']['welcome']), 'The welcome note is missing.');
+    $legacyHash = hash_file('sha256', $copy);
+    $legacyAgain = worker_command($copy, 'read');
+    check($legacyAgain['generation'] === $initial['generation']
+        && $legacyAgain['notes']['welcome']['version'] === $initial['notes']['welcome']['version']
+        && hash_file('sha256', $copy) === $legacyHash,
+        'Format-1 virtual security identities were not deterministic and read-only.');
+
+    $rekeyCopy = fixture_copy($temporaryRoot, $source, 'rekey', 'Could not create the rekey fixture.');
+    $rekeyBefore = worker_command($rekeyCopy, 'read');
+    $rekeyPrefix = worker_command($rekeyCopy, 'prefix');
+    $checkHash = hash_file('sha256', $rekeyCopy);
+    $cliCheck = run_bounded_command([PHP_BINARY, $rekeyCopy, '--check']);
+    check($cliCheck['status'] === 0 && str_contains($cliCheck['stdout'], 'format 2')
+        && hash_file('sha256', $rekeyCopy) === $checkHash,
+        'The CLI integrity check failed or rewrote its target.');
+    $cliRekey = run_bounded_command([PHP_BINARY, $rekeyCopy, '--rekey']);
+    $rekeyAfter = worker_command($rekeyCopy, 'read');
+    check($cliRekey['status'] === 0
+        && $rekeyAfter['revision'] === 1
+        && $rekeyAfter['notes']['welcome']['revision'] === 1
+        && $rekeyAfter['appearance']['revision'] === 0
+        && $rekeyAfter['generation'] !== $rekeyBefore['generation']
+        && $rekeyAfter['notes']['welcome']['version'] !== $rekeyBefore['notes']['welcome']['version']
+        && $rekeyAfter['notes']['welcome']['title'] === $rekeyBefore['notes']['welcome']['title']
+        && worker_command($rekeyCopy, 'prefix') === $rekeyPrefix
+        && str_contains(file_get_contents($rekeyCopy), "\nPIPLET-DATA/2\n"),
+        'CLI rekey did not rotate authority while preserving content and code.');
+
+    $importSource = fixture_copy($temporaryRoot, $source, 'import-source', 'Could not create the import source.');
+    $importRaw = file_get_contents($importSource);
+    $importDeclaration = "declare(strict_types=1);\n";
+    $markerComment = "/*\nPIPLET-DATA/2\n*/\n";
+    check(is_string($importRaw) && substr_count($importRaw, $importDeclaration) === 1
+        && file_put_contents($importSource,
+            str_replace($importDeclaration, $importDeclaration . $markerComment, $importRaw)) !== false,
+        'Could not add a harmless marker-looking source comment to the import fixture.');
+    worker_command($importSource, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Imported note', 'body' => 'trusted backup data', 'tags' => ['restore'],
+    ]);
+    $importDocument = worker_command($importSource, 'read');
+    $importTarget = fixture_copy($temporaryRoot, $source, 'import-target', 'Could not create the import target.');
+    $targetBefore = worker_command($importTarget, 'read');
+    $targetPrefix = worker_command($importTarget, 'prefix');
+    $importResult = run_bounded_command([
+        PHP_BINARY, $importTarget, '--import-snapshot-data', $importSource, '--rekey',
+    ]);
+    $imported = worker_command($importTarget, 'read');
+    check($importResult['status'] === 0
+        && array_keys($imported['notes']) === array_keys($importDocument['notes'])
+        && $imported['notes']['imported-note']['body'] === 'trusted backup data'
+        && $imported['generation'] !== $importDocument['generation']
+        && $imported['notes']['welcome']['version'] !== $importDocument['notes']['welcome']['version']
+        && $imported['revision'] === 1
+        && worker_command($importTarget, 'prefix') === $targetPrefix,
+        'CLI data import did not preserve backup data, ignore a prefix marker string, and rotate all authority.');
+    $staleAfterImport = worker_conflict($importTarget, 'save', [
+        'id' => 'welcome',
+        'baseGeneration' => $targetBefore['generation'],
+        'baseRevision' => $targetBefore['notes']['welcome']['revision'],
+        'baseVersion' => $targetBefore['notes']['welcome']['version'],
+        'createToken' => null,
+        'title' => 'Stale before import', 'body' => '', 'tags' => [],
+    ]);
+    check(($staleAfterImport['current']['id'] ?? null) === 'welcome',
+        'A pre-import request crossed the import/rekey generation boundary.');
+    $staleComposerAfterImport = worker_conflict($importTarget, 'save', [
+        'id' => null,
+        'baseGeneration' => $targetBefore['generation'],
+        'baseRevision' => 0,
+        'baseVersion' => null,
+        'createToken' => str_repeat('7', 32),
+        'title' => 'Stale unsent draft', 'body' => '', 'tags' => [],
+    ]);
+    check($staleComposerAfterImport['current'] === null,
+        'A pre-import unsent draft crossed the import/rekey generation boundary.');
+    $importLink = dirname($importTarget) . '/snapshot-link.php';
+    check(@symlink($importSource, $importLink), 'Could not create the import symlink fixture.');
+    $linkImport = run_bounded_command([
+        PHP_BINARY, $importTarget, '--import-snapshot-data', $importLink, '--rekey',
+    ]);
+    check($linkImport['status'] === 1 && str_contains($linkImport['stderr'], 'non-symlink'),
+        'CLI import followed a symbolic-link source.');
+    check(unlink($importLink), 'Could not clean the import symlink fixture.');
+
+    $importRaceTarget = fixture_copy($temporaryRoot, $source, 'import-race-target',
+        'Could not create the import path-race target.');
+    $importRaceSourceA = fixture_copy($temporaryRoot, $source, 'import-race-a',
+        'Could not create import race source A.');
+    $importRaceSourceB = fixture_copy($temporaryRoot, $source, 'import-race-b',
+        'Could not create import race source B.');
+    worker_command($importRaceSourceB, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Swapped import source', 'body' => '', 'tags' => [],
+    ]);
+    $importRaceCode = file_get_contents($importRaceTarget);
+    $importOpenNeedle = <<<'PHP'
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) {
+        throw new RuntimeException('The import source cannot be opened.');
+    }
+PHP;
+    $importOpenBarrier = <<<'PHP'
+    $testBarrier = getenv('PIPLET_TEST_IMPORT_BARRIER');
+    if (is_string($testBarrier) && $testBarrier !== '') {
+        file_put_contents($testBarrier . '.ready', '1', LOCK_EX);
+        $testDeadline = microtime(true) + 5;
+        while (!is_file($testBarrier . '.release')) {
+            if (microtime(true) >= $testDeadline) throw new RuntimeException('Import test barrier timed out.');
+            usleep(1000);
+        }
+    }
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) {
+        throw new RuntimeException('The import source cannot be opened.');
+    }
+PHP;
+    check(is_string($importRaceCode) && substr_count($importRaceCode, $importOpenNeedle) === 1,
+        'Could not locate the import lstat/open race point.');
+    $importRaceCode = str_replace($importOpenNeedle, $importOpenBarrier, $importRaceCode);
+    check(file_put_contents($importRaceTarget, $importRaceCode) === strlen($importRaceCode),
+        'Could not instrument the import lstat/open race.');
+    $importRaceHash = hash_file('sha256', $importRaceTarget);
+    $importBarrier = dirname($importRaceTarget) . '/import-open';
+    $importEnvironment = getenv();
+    $importEnvironment = is_array($importEnvironment) ? $importEnvironment : [];
+    $importEnvironment['PIPLET_TEST_IMPORT_BARRIER'] = $importBarrier;
+    $importWorker = start_worker($importRaceTarget, 'import-data', ['source' => $importRaceSourceA], $importEnvironment);
+    for ($attempt = 0; $attempt < 400 && !is_file($importBarrier . '.ready'); $attempt++) usleep(5000);
+    check(is_file($importBarrier . '.ready'), 'The import worker did not reach its lstat/open checkpoint.');
+    $importSourceAside = dirname($importRaceSourceA) . '/original.php';
+    check(rename($importRaceSourceA, $importSourceAside) && rename($importRaceSourceB, $importRaceSourceA),
+        'Could not swap the import source pathname.');
+    touch($importBarrier . '.release');
+    $importRaceFailure = finish_worker($importWorker, 2);
+    check(str_contains($importRaceFailure['stderr'], 'import source changed')
+        && hash_file('sha256', $importRaceTarget) === $importRaceHash,
+        'Import accepted a different inode installed between lstat and fopen.');
+
+    $corruptImportTarget = fixture_copy($temporaryRoot, $source, 'import-corrupt-target', 'Could not create the corrupt import target.');
+    $corruptImportPrefix = worker_command($corruptImportTarget, 'prefix');
+    check(replace_fixture_trailer($corruptImportTarget, "\nPIPLET-DATA/2\n", '{'),
+        'Could not corrupt the import target trailer.');
+    $corruptImport = run_bounded_command([
+        PHP_BINARY, $corruptImportTarget, '--import-snapshot-data', $importSource, '--rekey',
+    ]);
+    $recoveredImport = worker_command($corruptImportTarget, 'read');
+    check($corruptImport['status'] === 0
+        && isset($recoveredImport['notes']['imported-note'])
+        && $recoveredImport['revision'] === 1
+        && worker_command($corruptImportTarget, 'prefix') === $corruptImportPrefix,
+        'The trusted import path could not repair a corrupt live trailer.');
+
+    $ceilingCopy = fixture_copy($temporaryRoot, $source, 'revision-ceiling', 'Could not create the revision-ceiling fixture.');
+    $ceilingDocument = worker_command($ceilingCopy, 'read');
+    $ceilingDocument['revision'] = 9007199254740991;
+    foreach ($ceilingDocument['notes'] as &$ceilingNote) $ceilingNote['revision'] = 9007199254740991;
+    unset($ceilingNote);
+    $ceilingJson = json_encode($ceilingDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    check(replace_fixture_trailer($ceilingCopy, "\nPIPLET-DATA/2\n", $ceilingJson),
+        'Could not install the revision-ceiling fixture.');
+    $ceilingRekey = run_bounded_command([PHP_BINARY, $ceilingCopy, '--rekey']);
+    $ceilingAfter = worker_command($ceilingCopy, 'read');
+    check($ceilingRekey['status'] === 0 && $ceilingAfter['revision'] === 1
+        && $ceilingAfter['notes']['welcome']['revision'] === 1,
+        'Rekey could not recover a document at the revision ceiling.');
+
+    foreach ([
+        null,
+        ['plain' => 'value', 'slashes' => '</script>', 'unicode' => "snowman ☃\u{2028}", 'nul' => "a\0b"],
+        ['list' => [1, 1.0, true, false, null, ['nested' => ['x', 'y']]]],
+    ] as $jsonLengthValue) {
+        $lengths = worker_command($copy, 'json-length', ['value' => $jsonLengthValue]);
+        check($lengths['projected'] === $lengths['actual'], 'Projected JSON length diverged from the serializer.');
+    }
+
+    $denseStoredCopy = fixture_copy($temporaryRoot, $source, 'dense-stored', 'Could not create the dense stored-data fixture.');
+    $denseBase = json_encode($initial, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $denseStoredJson = substr($denseBase, 0, -1) . ',"unknown":[' . str_repeat('[],', 50000) . '[]]}';
+    check(replace_fixture_trailer($denseStoredCopy, "\nPIPLET-DATA/2\n", $denseStoredJson),
+        'Could not write the dense stored-data fixture.');
+    $denseStoredFailure = finish_worker(start_worker($denseStoredCopy, 'read', []), 2);
+    check(str_contains($denseStoredFailure['stderr'], 'too structurally complex'),
+        'Dense stored JSON reached decoding instead of the structural guard.');
+    [$denseServer, $densePort] = start_test_server(
+        dirname($denseStoredCopy),
+        test_environment(['PIPLET_PASSWORD' => 'dense-test']),
+        'Could not start the invalid-data recovery server.'
+    );
+    try {
+        $denseAuthorization = ['Authorization: Basic ' . base64_encode('writer:dense-test')];
+        [$densePageStatus, $densePageHeaders, $densePageBody] = http_request("http://127.0.0.1:$densePort/", 'GET', $denseAuthorization);
+        [$denseDownloadStatus, , $denseDownloadBody] = http_request(
+            "http://127.0.0.1:$densePort/?download=1", 'GET', $denseAuthorization
+        );
+        check($densePageStatus === 500 && !str_contains($densePageBody, $denseStoredJson)
+            && str_contains((string) header_value($densePageHeaders, 'Content-Security-Policy'), "default-src 'none'")
+            && strtolower((string) header_value($densePageHeaders, 'X-Content-Type-Options')) === 'nosniff'
+            && $denseDownloadStatus === 200 && $denseDownloadBody === file_get_contents($denseStoredCopy),
+            'Invalid stored JSON did not fail closed while preserving authenticated raw recovery.');
+    } finally {
+        stop_test_server($denseServer, 'invalid-data recovery');
+    }
+
+    $closureCopy = fixture_copy($temporaryRoot, $source, 'structure-closure', 'Could not create the structure-closure fixture.');
+    $closureDocument = fixture_document_object($closureCopy);
+    $closureDocument->padding = array_fill(0, 99948, 0);
+    $closureJson = json_encode($closureDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    check(replace_fixture_trailer($closureCopy, "\nPIPLET-DATA/1\n", $closureJson),
+        'Could not install the near-structure-limit fixture.');
+    worker_command($closureCopy, 'read');
+    $closureHash = hash_file('sha256', $closureCopy);
+    $closureFailure = finish_worker(start_worker($closureCopy, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Must remain readable', 'body' => '', 'tags' => [],
+    ]), 2);
+    check(str_contains($closureFailure['stderr'], 'structurally complex')
+        && hash_file('sha256', $closureCopy) === $closureHash
+        && glob(dirname($closureCopy) . '/.piplet-tmp-*.php') === [],
+        'A mutation wrote a snapshot outside the reader structural budget.');
+
+    $noteLimitCopy = fixture_copy($temporaryRoot, $source, 'note-limit', 'Could not create the note-limit fixture.');
+    $limitDocument = $initial;
+    $limitDocument['notes'] = [];
+    $limitTags = array_map(static fn (int $index): string => "t$index", range(0, 11));
+    for ($index = 0; $index < 2000; $index++) {
+        $id = "p$index";
+        $limitDocument['notes'][$id] = [
+            'id' => $id, 'title' => $id, 'body' => '', 'tags' => $limitTags,
+            'revision' => 1, 'version' => substr(hash('sha256', $id), 0, 32),
+            'created' => '2026-01-01T00:00:00Z', 'updated' => '2026-01-01T00:00:00Z',
+        ];
+    }
+    $limitJson = json_encode($limitDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    check(replace_fixture_trailer($noteLimitCopy, "\nPIPLET-DATA/2\n", $limitJson)
+        && count(worker_command($noteLimitCopy, 'read')['notes']) === 2000,
+        'The documented note/tag cardinality boundary was not accepted.');
+    $limitDocument['notes']['overflow'] = [
+        'id' => 'overflow', 'title' => 'overflow', 'body' => '', 'tags' => [],
+        'revision' => 1, 'version' => str_repeat('f', 32),
+        'created' => '2026-01-01T00:00:00Z', 'updated' => '2026-01-01T00:00:00Z',
+    ];
+    $overLimitJson = json_encode($limitDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    check(replace_fixture_trailer($noteLimitCopy, "\nPIPLET-DATA/2\n", $overLimitJson),
+        'Could not write the over-limit note fixture.');
+    $noteLimitFailure = finish_worker(start_worker($noteLimitCopy, 'read', []), 2);
+    check(str_contains($noteLimitFailure['stderr'], 'Invalid note collection'),
+        'A stored document above the note limit passed validation.');
+    unset($limitDocument, $limitJson, $overLimitJson, $denseStoredJson, $denseBase);
     $numericIdFailure = finish_worker(start_worker($copy, 'numeric-id', []), 2);
     check(str_contains($numericIdFailure['stderr'], 'Invalid note identifier'), 'A stored numeric-only note identifier passed validation.');
     check(worker_command($copy, 'cookie-path', ['script' => '/notes./piplet.php']) === '/notes./', 'A trailing dot was stripped from the CSRF cookie directory.');
     check(worker_command($copy, 'cookie-path', ['script' => '/piplet.php']) === '/', 'The root CSRF cookie path was malformed.');
+    foreach ([null, '', '0', 'off', 'OFF'] as $httpsValue) {
+        $httpsInput = $httpsValue === null ? [] : ['https' => $httpsValue];
+        check(worker_command($copy, 'request-is-https', $httpsInput) === false,
+            'A non-TLS HTTPS server value enabled Secure cookies.');
+    }
+    foreach (['on', '1'] as $httpsValue) {
+        check(worker_command($copy, 'request-is-https', ['https' => $httpsValue]) === true,
+            'A TLS HTTPS server value disabled Secure cookies.');
+    }
+    check(worker_command($copy, 'request-is-https', ['https' => 'off', 'public' => true]) === true,
+        'The explicit public-HTTPS setting did not enable Secure cookies.');
+    $basic = base64_encode('writer:fallback secret');
+    check(worker_command($copy, 'authorization-password', ['authorization' => "basic  $basic"]) === 'fallback secret'
+        && worker_command($copy, 'authorization-password', ['redirectAuthorization' => "Basic $basic"]) === 'fallback secret'
+        && worker_command($copy, 'authorization-password', ['phpAuth' => 'primary', 'authorization' => "Basic $basic"]) === 'primary'
+        && worker_command($copy, 'authorization-password', ['authorization' => 'Basic !!!']) === ''
+        && worker_command($copy, 'authorization-password', ['authorization' => 'Basic ' . base64_encode('missing-colon')]) === '',
+        'The raw Basic-authorization fallback did not parse or prioritize credentials safely.');
     $sourceText = file_get_contents($source);
     check(is_string($sourceText), 'Could not read the production CSS for contrast checks.');
+    check(preg_match('/function piplet_mutate\(callable \$change\): array\s*\{\s*piplet_require_runtime\(\);/', $sourceText) === 1,
+        'A direct mutation path bypasses the required 64-bit runtime guard.');
     check(
         preg_match('/font-size\s*:\s*var\(--title-size\)/', css_braced_block($sourceText, '.note-title')) === 1,
         'The note title stopped honoring the shared title-size token.'
@@ -686,7 +1197,7 @@ try {
         if (str_contains($rule[1], '.note-title') && preg_match('/font-size\s*:\s*([^;]+)/', $rule[2], $size) === 1) {
             $mobileNoteTitleValid = trim($size[1]) === 'var(--title-size)';
         }
-        if (str_contains($rule[1], '.field-title input') && preg_match('/font-size\s*:\s*var\(--title-size\)/', $rule[2]) === 1) {
+        if (str_contains($rule[1], '.field-title textarea') && preg_match('/font-size\s*:\s*var\(--title-size\)/', $rule[2]) === 1) {
             $mobileEditorTitleValid = true;
         }
     }
@@ -719,15 +1230,26 @@ try {
     check($visiblePermissions !== false && ($visiblePermissions & 0777) === 0600, 'tempnam did not create mode 0600 at first visibility under umask 0000.');
     check(unlink($visibleTemp), 'Could not clean the first-visibility temporary file.');
     check(strlen(worker_command($copy, 'large-output')) === 1024 * 1024, 'The worker runner deadlocked or truncated a large response.');
+    check(worker_command($copy, 'short-write') === true,
+        'The persistence write loop did not complete positive short writes exactly.');
     foreach ([0, 0777] as $testUmask) {
         $tempInfo = worker_command($copy, 'temp-info', ['umask' => $testUmask]);
         check($tempInfo['mode'] === 0600, 'A temporary snapshot was not private from first use.');
         check(realpath($tempInfo['directory']) === realpath(dirname($copy)), 'A temporary snapshot was not created beside the piplet.');
         check(str_contains($tempInfo['basename'], '.piplet-tmp-') && str_ends_with($tempInfo['basename'], '.php'), 'A temporary snapshot lost its guarded PHP name.');
     }
+    $noSyncHash = hash_file('sha256', $copy);
+    $noSyncInput = base64_encode(json_encode([
+        'id' => null, 'baseRevision' => 0, 'title' => 'No fsync', 'body' => '', 'tags' => [],
+    ], JSON_THROW_ON_ERROR));
+    $noSync = run_bounded_command([
+        PHP_BINARY, '-d', 'disable_functions=fsync', __FILE__, '--worker', $copy, 'save', $noSyncInput,
+    ], 5.0, [...test_environment(), 'PIPLET_TEST_ROOT' => $temporaryRoot]);
+    check($noSync['status'] === 2 && str_contains($noSync['stderr'], 'file synchronization is disabled')
+        && hash_file('sha256', $copy) === $noSyncHash,
+        'Saving without fsync did not fail closed before mutation.');
 
-    $defaultAppearance = [
-        'revision' => 0,
+    $defaultAppearanceValues = [
         'palette' => 'quiet',
         'font' => 'editorial',
         'scale' => 'comfortable',
@@ -735,12 +1257,16 @@ try {
         'customCss' => '',
     ];
     $appearanceCopy = fixture_copy($temporaryRoot, $source, 'appearance', 'Could not create the appearance fixture.');
-    check(worker_command($appearanceCopy, 'current-appearance') === $defaultAppearance, 'A document without appearance settings did not use the defaults.');
+    $defaultAppearance = worker_command($appearanceCopy, 'current-appearance');
+    check($defaultAppearance['revision'] === 0
+        && preg_match('/^[a-f0-9]{32}$/D', $defaultAppearance['version']) === 1
+        && array_diff_key($defaultAppearance, ['revision' => true, 'version' => true]) === $defaultAppearanceValues,
+        'A document without appearance settings did not use the defaults.');
     $appearancePrefix = worker_command($appearanceCopy, 'prefix');
     $defaultHash = hash_file('sha256', $appearanceCopy);
     clearstatcache(true, $appearanceCopy);
     $defaultInode = fileinode($appearanceCopy);
-    $defaultNoop = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 0, 'appearance' => array_diff_key($defaultAppearance, ['revision' => true])]);
+    $defaultNoop = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $defaultAppearanceValues]);
     clearstatcache(true, $appearanceCopy);
     check($defaultNoop['document']['revision'] === 1 && $defaultNoop['result'] === $defaultAppearance, 'Saving effective appearance defaults was not a no-op.');
     check(hash_file('sha256', $appearanceCopy) === $defaultHash && fileinode($appearanceCopy) === $defaultInode, 'A default appearance no-op rewrote the file.');
@@ -752,8 +1278,11 @@ try {
         'customCss' => ".story { --test-label: 'ocean'; }",
     ];
     $savedAppearance = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $oceanAppearance]);
-    $expectedOcean = ['revision' => 2] + $oceanAppearance;
-    check($savedAppearance['result'] === $expectedOcean && $savedAppearance['document']['revision'] === 2, 'Appearance settings did not get a global commit revision.');
+    $expectedOcean = $savedAppearance['result'];
+    check($expectedOcean['revision'] === 2
+        && preg_match('/^[a-f0-9]{32}$/D', $expectedOcean['version']) === 1
+        && array_diff_key($expectedOcean, ['revision' => true, 'version' => true]) === $oceanAppearance
+        && $savedAppearance['document']['revision'] === 2, 'Appearance settings did not get a global commit revision.');
     check(worker_command($appearanceCopy, 'current-appearance') === $expectedOcean, 'Appearance settings did not persist across worker restarts.');
     check(worker_command($appearanceCopy, 'prefix') === $appearancePrefix, 'An appearance save changed the executable prefix.');
     $oceanHash = hash_file('sha256', $appearanceCopy);
@@ -776,15 +1305,18 @@ try {
         'customCss' => '',
     ];
     $afterUnrelated = worker_command($appearanceCopy, 'appearance', ['baseRevision' => 2, 'appearance' => $plumAppearance]);
-    check($afterUnrelated['result'] === ['revision' => 4] + $plumAppearance, 'An unrelated note edit caused an appearance conflict.');
+    check($afterUnrelated['result']['revision'] === 4
+        && array_diff_key($afterUnrelated['result'], ['revision' => true, 'version' => true]) === $plumAppearance,
+        'An unrelated note edit caused an appearance conflict.');
     check(isset($afterUnrelated['document']['notes']['unrelated-note']), 'An appearance save lost an unrelated note edit.');
 
     $appearanceAbaCopy = fixture_copy($temporaryRoot, $source, 'appearance-aba', 'Could not create the appearance revision fixture.');
     $firstAppearance = worker_command($appearanceAbaCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $oceanAppearance]);
-    $resetAppearance = worker_command($appearanceAbaCopy, 'appearance', ['baseRevision' => $firstAppearance['result']['revision'], 'appearance' => array_diff_key($defaultAppearance, ['revision' => true])]);
-    $expectedReset = $defaultAppearance;
-    $expectedReset['revision'] = 3;
-    check($resetAppearance['result'] === $expectedReset, 'Restoring default appearance did not persist as a new revision.');
+    $resetAppearance = worker_command($appearanceAbaCopy, 'appearance', ['baseRevision' => $firstAppearance['result']['revision'], 'appearance' => $defaultAppearanceValues]);
+    $expectedReset = $resetAppearance['result'];
+    check($expectedReset['revision'] === 3
+        && array_diff_key($expectedReset, ['revision' => true, 'version' => true]) === $defaultAppearanceValues,
+        'Restoring default appearance did not persist as a new revision.');
     $resetHash = hash_file('sha256', $appearanceAbaCopy);
     $staleAppearance = worker_conflict($appearanceAbaCopy, 'appearance', ['baseRevision' => 0, 'appearance' => $plumAppearance]);
     check($staleAppearance['current'] === $expectedReset, 'A stale appearance save crossed a customize/reset boundary.');
@@ -817,7 +1349,20 @@ try {
         check(str_contains($failure['stderr'], 'PipletHttpError'), 'Invalid appearance input was not rejected as a request error.');
     }
     check(hash_file('sha256', $invalidAppearanceCopy) === $invalidAppearanceHash, 'Invalid appearance input changed the file.');
-    check(worker_command($invalidAppearanceCopy, 'current-appearance') === $defaultAppearance, 'Invalid appearance input changed the effective defaults.');
+    $invalidDefaults = worker_command($invalidAppearanceCopy, 'current-appearance');
+    check($invalidDefaults['revision'] === 0
+        && array_diff_key($invalidDefaults, ['revision' => true, 'version' => true]) === $defaultAppearanceValues,
+        'Invalid appearance input changed the effective defaults.');
+
+    $exactCssCopy = fixture_copy($temporaryRoot, $source, 'appearance-exact-css',
+        'Could not create the exact custom-CSS fixture.');
+    $exactCssAppearance = $oceanAppearance;
+    $exactCssAppearance['customCss'] = str_repeat('x', 32 * 1024);
+    $exactCssSaved = worker_command($exactCssCopy, 'appearance', [
+        'baseRevision' => 0, 'appearance' => $exactCssAppearance,
+    ]);
+    check(strlen($exactCssSaved['result']['customCss']) === 32 * 1024,
+        'Custom CSS at the exact 32 KiB limit was rejected or changed.');
 
     $legacyAppearanceCopy = fixture_copy($temporaryRoot, $source, 'appearance-legacy', 'Could not create the legacy appearance fixture.');
     worker_command($legacyAppearanceCopy, 'inject-appearance', [
@@ -828,12 +1373,174 @@ try {
         'tokens' => ['--story-width' => '60rem', '--accent' => 'url(https://invalid.example)', '--future-token' => '#ffffff'],
     ]);
     $legacyEffective = worker_command($legacyAppearanceCopy, 'current-appearance');
-    check($legacyEffective === ['revision' => 2, 'palette' => 'quiet', 'font' => 'modern', 'scale' => 'large', 'measure' => 'balanced', 'customCss' => ":root {\n  --story-width: 60rem;\n}"], 'A sparse appearance record did not migrate its safe legacy CSS.');
+    check(array_diff_key($legacyEffective, ['version' => true]) === ['revision' => 2, 'palette' => 'quiet', 'font' => 'modern', 'scale' => 'large', 'measure' => 'balanced', 'customCss' => ":root {\n  --story-width: 60rem;\n}"], 'A sparse appearance record did not migrate its safe legacy CSS.');
     $legacySaved = worker_command($legacyAppearanceCopy, 'appearance', ['baseRevision' => 2, 'appearance' => $plumAppearance]);
-    check($legacySaved['result'] === ['revision' => 3] + $plumAppearance, 'A migrated appearance could not be saved.');
+    check($legacySaved['result']['revision'] === 3
+        && array_diff_key($legacySaved['result'], ['revision' => true, 'version' => true]) === $plumAppearance,
+        'A migrated appearance could not be saved.');
     $legacyRaw = worker_command($legacyAppearanceCopy, 'read');
     check(($legacyRaw['appearance']['futureSetting']['kept'] ?? false) === true, 'A future appearance field was erased by a known-setting save.');
     check(($legacyRaw['appearance']['tokens']['--future-token'] ?? null) === '#ffffff', 'A future design token was erased by a known-setting save.');
+
+    $typedCopy = fixture_copy($temporaryRoot, $source, 'typed-extensions', 'Could not create the typed-extension fixture.');
+    $typedDocument = worker_command($typedCopy, 'read');
+    $typedDocument['futureEmpty'] = new stdClass();
+    $typedDocument['futureNumeric'] = (object) ['0' => 'zero', '1' => 'one'];
+    $typedDocument['futureFloat'] = 1.0;
+    $typedDocument['futureFraction'] = 0.1;
+    $typedDocument['appearance']['futureEmpty'] = new stdClass();
+    $typedDocument['appearance'][5] = 'appearance-five';
+    $typedDocument['notes']['welcome']['futureNumeric'] = (object) ['0' => 'note-zero'];
+    $typedDocument['notes']['welcome'][7] = 'note-seven';
+    $typedJson = json_encode($typedDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+    check(replace_fixture_trailer($typedCopy, "\nPIPLET-DATA/2\n", $typedJson),
+        'Could not install typed extension data.');
+    worker_command($typedCopy, 'save', [
+        'id' => 'welcome', 'title' => $typedDocument['notes']['welcome']['title'],
+        'body' => $typedDocument['notes']['welcome']['body'] . "\nTyped round trip",
+        'tags' => $typedDocument['notes']['welcome']['tags'],
+        'baseRevision' => $typedDocument['notes']['welcome']['revision'],
+    ]);
+    worker_command($typedCopy, 'appearance', [
+        'baseRevision' => $typedDocument['appearance']['revision'],
+        'appearance' => $oceanAppearance,
+    ]);
+    $typedStored = fixture_document_object($typedCopy);
+    $typedAppearanceFields = get_object_vars($typedStored->appearance);
+    $typedNoteFields = get_object_vars($typedStored->notes->welcome);
+    check($typedStored->futureEmpty instanceof stdClass
+        && get_object_vars($typedStored->futureEmpty) === []
+        && $typedStored->futureNumeric instanceof stdClass
+        && get_object_vars($typedStored->futureNumeric) === ['0' => 'zero', '1' => 'one']
+        && is_float($typedStored->futureFloat) && $typedStored->futureFloat === 1.0
+        && is_float($typedStored->futureFraction) && $typedStored->futureFraction === 0.1
+        && $typedStored->appearance->futureEmpty instanceof stdClass
+        && $typedStored->notes->welcome->futureNumeric instanceof stdClass
+        && ($typedAppearanceFields[5] ?? null) === 'appearance-five'
+        && ($typedNoteFields[7] ?? null) === 'note-seven',
+        'A mutation changed the JSON type or value of an unknown extension.');
+
+    $legacyNumericCopy = fixture_copy($temporaryRoot, $source, 'legacy-numeric-extension',
+        'Could not create the legacy numeric-extension fixture.');
+    $legacyNumericDocument = fixture_document_object($legacyNumericCopy);
+    $legacyNumericDocument->appearance = (object) ['revision' => 1, 5 => 'legacy-five'];
+    $legacyNumericJson = json_encode($legacyNumericDocument, JSON_THROW_ON_ERROR
+        | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    check(replace_fixture_trailer($legacyNumericCopy, "\nPIPLET-DATA/1\n", $legacyNumericJson),
+        'Could not install the legacy numeric-extension fixture.');
+    worker_command($legacyNumericCopy, 'appearance', ['baseRevision' => 1, 'appearance' => $oceanAppearance]);
+    $legacyNumericStored = fixture_document_object($legacyNumericCopy);
+    check((get_object_vars($legacyNumericStored->appearance)[5] ?? null) === 'legacy-five',
+        'Format-1 appearance migration renamed a numeric extension field.');
+
+    foreach ([
+        '9223372036854775808',
+        '1e400',
+        '9007199254740993.0',
+        '0.10000000000000001',
+        '1e-325',
+    ] as $numberLiteral) {
+        $numberCopy = fixture_copy($temporaryRoot, $source, 'number-' . md5($numberLiteral),
+            'Could not create the unsafe-number fixture.');
+        $numberDocument = worker_command($numberCopy, 'read');
+        $numberDocument['futureNumber'] = 'PIPLET_NUMBER_SENTINEL';
+        $numberJson = json_encode($numberDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+            | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+        $numberJson = str_replace('"PIPLET_NUMBER_SENTINEL"', $numberLiteral, $numberJson, $numberReplacements);
+        check($numberReplacements === 1
+            && replace_fixture_trailer($numberCopy, "\nPIPLET-DATA/2\n", $numberJson),
+            'Could not install the unsafe-number fixture.');
+        $numberHash = hash_file('sha256', $numberCopy);
+        $numberFailure = finish_worker(start_worker($numberCopy, 'read', []), 2);
+        check(str_contains($numberFailure['stderr'], 'cannot preserve exactly')
+            && hash_file('sha256', $numberCopy) === $numberHash,
+            'A JSON number that PHP cannot preserve was accepted or changed on failure.');
+    }
+
+    foreach ([
+        '"futureDuplicate":{"x":1,"x":2}',
+        '"futureDuplicate":{"x":1,"\\u0078":2}',
+        '"futureDuplicate":{"nested":{"x":1,"\\u0078":2}}',
+    ] as $duplicateMember) {
+        $duplicateCopy = fixture_copy($temporaryRoot, $source, 'duplicate-' . md5($duplicateMember),
+            'Could not create the duplicate-member fixture.');
+        $duplicateDocument = worker_command($duplicateCopy, 'read');
+        $duplicateJson = json_encode($duplicateDocument, JSON_THROW_ON_ERROR
+            | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+        $duplicateJson = substr($duplicateJson, 0, -1) . ',' . $duplicateMember . '}';
+        check(replace_fixture_trailer($duplicateCopy, "\nPIPLET-DATA/2\n", $duplicateJson),
+            'Could not install the duplicate-member fixture.');
+        $duplicateHash = hash_file('sha256', $duplicateCopy);
+        $duplicateFailure = finish_worker(start_worker($duplicateCopy, 'read', []), 2);
+        check(str_contains($duplicateFailure['stderr'], 'duplicate object member names')
+            && hash_file('sha256', $duplicateCopy) === $duplicateHash,
+            'A duplicate or escape-equivalent JSON member was accepted or changed on failure.');
+    }
+
+    foreach ([
+        '"bad' . "\xC0\xAF" . '"',
+        '"\\ud800"',
+    ] as $invalidTextLiteral) {
+        $invalidTextCopy = fixture_copy($temporaryRoot, $source, 'invalid-text-' . md5($invalidTextLiteral),
+            'Could not create the invalid-text fixture.');
+        $invalidTextDocument = worker_command($invalidTextCopy, 'read');
+        $invalidTextJson = json_encode($invalidTextDocument, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+            | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+        $invalidTextJson = substr($invalidTextJson, 0, -1) . ',"futureText":' . $invalidTextLiteral . '}';
+        check(replace_fixture_trailer($invalidTextCopy, "\nPIPLET-DATA/2\n", $invalidTextJson),
+            'Could not install the invalid-text fixture.');
+        $invalidTextHash = hash_file('sha256', $invalidTextCopy);
+        $invalidTextFailure = finish_worker(start_worker($invalidTextCopy, 'read', []), 2);
+        check(str_contains($invalidTextFailure['stderr'], 'not valid JSON')
+            && hash_file('sha256', $invalidTextCopy) === $invalidTextHash,
+            'Invalid UTF-8 or an unpaired JSON surrogate was accepted or changed on failure.');
+    }
+
+    $emptyNotesCopy = fixture_copy($temporaryRoot, $source, 'empty-note-map', 'Could not create the empty-note-map fixture.');
+    worker_command($emptyNotesCopy, 'delete', ['id' => 'welcome', 'baseRevision' => 1]);
+    $emptyNotesStored = fixture_document_object($emptyNotesCopy);
+    check($emptyNotesStored->notes instanceof stdClass && get_object_vars($emptyNotesStored->notes) === [],
+        'Deleting the final note serialized the note map as a JSON array.');
+
+    $forkNoteA = fixture_copy($temporaryRoot, $source, 'fork-note-a', 'Could not create note fork A.');
+    $forkNoteB = fixture_copy($temporaryRoot, $source, 'fork-note-b', 'Could not create note fork B.');
+    $forkSavedA = worker_command($forkNoteA, 'save', [
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Fork A', 'body' => 'branch A', 'tags' => [],
+    ]);
+    $forkSavedB = worker_command($forkNoteB, 'save', [
+        'id' => 'welcome', 'baseRevision' => 1, 'title' => 'Fork B', 'body' => 'branch B', 'tags' => [],
+    ]);
+    $forkNoteHash = hash_file('sha256', $forkNoteB);
+    $forkNoteConflict = worker_conflict($forkNoteB, 'save', [
+        'id' => 'welcome',
+        'baseGeneration' => $forkSavedA['document']['generation'],
+        'baseRevision' => $forkSavedA['result']['revision'],
+        'baseVersion' => $forkSavedA['result']['version'],
+        'createToken' => null, 'title' => 'Crossed fork', 'body' => '', 'tags' => [],
+    ]);
+    check($forkSavedA['result']['revision'] === $forkSavedB['result']['revision']
+        && $forkSavedA['result']['version'] !== $forkSavedB['result']['version']
+        && ($forkNoteConflict['current']['title'] ?? null) === 'Fork B'
+        && hash_file('sha256', $forkNoteB) === $forkNoteHash,
+        'Equal numeric note revisions crossed a random-version fork.');
+
+    $forkAppearanceA = fixture_copy($temporaryRoot, $source, 'fork-appearance-a', 'Could not create appearance fork A.');
+    $forkAppearanceB = fixture_copy($temporaryRoot, $source, 'fork-appearance-b', 'Could not create appearance fork B.');
+    $forkAppearanceSavedA = worker_command($forkAppearanceA, 'appearance', ['baseRevision' => 0, 'appearance' => $oceanAppearance]);
+    $forkAppearanceSavedB = worker_command($forkAppearanceB, 'appearance', ['baseRevision' => 0, 'appearance' => $plumAppearance]);
+    $forkAppearanceHash = hash_file('sha256', $forkAppearanceB);
+    $forkAppearanceConflict = worker_conflict($forkAppearanceB, 'appearance', [
+        'baseGeneration' => $forkAppearanceSavedA['document']['generation'],
+        'baseRevision' => $forkAppearanceSavedA['result']['revision'],
+        'baseVersion' => $forkAppearanceSavedA['result']['version'],
+        'appearance' => $defaultAppearanceValues,
+    ]);
+    check($forkAppearanceSavedA['result']['revision'] === $forkAppearanceSavedB['result']['revision']
+        && $forkAppearanceSavedA['result']['version'] !== $forkAppearanceSavedB['result']['version']
+        && ($forkAppearanceConflict['current']['palette'] ?? null) === 'plum'
+        && hash_file('sha256', $forkAppearanceB) === $forkAppearanceHash,
+        'Equal numeric appearance revisions crossed a random-version fork.');
 
     $idempotentCopy = fixture_copy($temporaryRoot, $source, 'idempotent-create', 'Could not create the idempotent-create fixture.');
     $createPayload = [
@@ -854,7 +1561,7 @@ try {
     check($retryConflict['current']['id'] === $createdOnce['result']['id'], 'A changed retry did not conflict with its original create.');
     check(hash_file('sha256', $idempotentCopy) === $onceHash, 'A changed create retry modified the file.');
     $updatedTokenNote = worker_command($idempotentCopy, 'save', [
-        'id' => $createdOnce['result']['id'], 'baseRevision' => 2, 'createToken' => str_repeat('b', 32),
+        'id' => $createdOnce['result']['id'], 'baseRevision' => 2, 'createToken' => null,
         'title' => 'Only once', 'body' => 'Updated', 'tags' => ['retry'],
     ]);
     check($updatedTokenNote['result']['createToken'] === str_repeat('a', 32), 'Updating a note replaced its stable creation token.');
@@ -895,6 +1602,22 @@ try {
     check($recreatedWelcome['result']['id'] === 'welcome' && $recreatedWelcome['result']['revision'] === 4, 'Recreated slugs did not get a new generation revision.');
     $abaDelete = worker_conflict($abaCopy, 'delete', ['id' => 'welcome', 'baseRevision' => 2]);
     check($abaDelete['current']['body'] === 'new generation', 'A stale delete crossed a delete/recreate boundary.');
+
+    $roundTripCopy = fixture_copy($temporaryRoot, $source, 'exact-editor-values', 'Could not create the exact-value fixture.');
+    $exactTitle = "  title with spacing\nand a line  ";
+    $exactTags = ['comma, tag', ' duplicate ', ' duplicate ', "line\nbreak", "nul\0tag"];
+    $exactCreated = worker_command($roundTripCopy, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => $exactTitle, 'body' => 'first body', 'tags' => $exactTags,
+    ]);
+    $exactUpdated = worker_command($roundTripCopy, 'save', [
+        'id' => $exactCreated['result']['id'],
+        'baseRevision' => $exactCreated['result']['revision'],
+        'title' => $exactTitle, 'body' => 'body-only edit', 'tags' => $exactTags,
+    ]);
+    check($exactUpdated['result']['title'] === $exactTitle
+        && $exactUpdated['result']['tags'] === $exactTags
+        && worker_command($roundTripCopy, 'read')['notes'][$exactCreated['result']['id']]['tags'] === $exactTags,
+        'A body-only edit changed accepted title or tag values.');
 
     $hostileBody = "A null follows: \0\r\n__halt_compiler();\r\nPIPLET-DATA/1\r\n<?php echo 'not code'; ?>\r\n</script>\r\nSnowman: ☃";
     $created = worker_command($copy, 'save', [
@@ -1008,6 +1731,63 @@ PHP;
     check(isset($raceDocument['notes']['opened-before-rename']), 'The retried mutation was lost.');
     check($raceDocument['revision'] === 3, 'The deterministic race lost a document revision.');
 
+    // Pause after the complete temp snapshot is closed, then replace the live
+    // pathname. The final identity check must protect that replacement.
+    $finalRaceCopy = fixture_copy($temporaryRoot, $source, 'final-race',
+        'Could not create the final-path-race fixture.');
+    $finalRaceRoot = dirname($finalRaceCopy);
+    $finalRaceSource = file_get_contents($finalRaceCopy);
+    $finalRaceNeedle = <<<'PHP'
+        $tempHandle = null;
+
+        // Refuse to clobber an out-of-band replacement made while we prepared.
+PHP;
+    $finalRaceBarrier = <<<'PHP'
+        $tempHandle = null;
+
+        $testBarrier = getenv('PIPLET_TEST_FINAL_PATH_BARRIER');
+        if (is_string($testBarrier) && $testBarrier !== '') {
+            file_put_contents($testBarrier . '.ready', '1', LOCK_EX);
+            $testDeadline = microtime(true) + 5;
+            while (!is_file($testBarrier . '.release')) {
+                if (microtime(true) >= $testDeadline) throw new RuntimeException('Final-path test barrier timed out.');
+                usleep(1000);
+            }
+        }
+
+        // Refuse to clobber an out-of-band replacement made while we prepared.
+PHP;
+    check(is_string($finalRaceSource) && substr_count($finalRaceSource, $finalRaceNeedle) === 1,
+        'Could not locate the final pathname revalidation point.');
+    $finalRaceSource = str_replace($finalRaceNeedle, $finalRaceBarrier, $finalRaceSource);
+    check(file_put_contents($finalRaceCopy, $finalRaceSource) === strlen($finalRaceSource),
+        'Could not instrument the final pathname race.');
+    $replacement = $finalRaceRoot . '/replacement.php';
+    check(copy($finalRaceCopy, $replacement), 'Could not create the final pathname replacement.');
+    worker_command($replacement, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Out of band replacement', 'body' => '', 'tags' => [],
+    ]);
+    $replacementHash = hash_file('sha256', $replacement);
+    $finalBarrier = $finalRaceRoot . '/final-path';
+    $finalEnvironment = getenv();
+    $finalEnvironment = is_array($finalEnvironment) ? $finalEnvironment : [];
+    $finalEnvironment['PIPLET_TEST_FINAL_PATH_BARRIER'] = $finalBarrier;
+    $finalWorker = start_worker($finalRaceCopy, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Must not clobber replacement', 'body' => '', 'tags' => [],
+    ], $finalEnvironment);
+    for ($attempt = 0; $attempt < 400 && !is_file($finalBarrier . '.ready'); $attempt++) usleep(5000);
+    check(is_file($finalBarrier . '.ready'), 'The final-path worker did not reach its checkpoint.');
+    check(rename($replacement, $finalRaceCopy), 'Could not install the out-of-band replacement.');
+    touch($finalBarrier . '.release');
+    $finalFailure = finish_worker($finalWorker, 2);
+    $finalDocument = worker_command($finalRaceCopy, 'read');
+    check(str_contains($finalFailure['stderr'], 'changed during the save')
+        && hash_file('sha256', $finalRaceCopy) === $replacementHash
+        && isset($finalDocument['notes']['out-of-band-replacement'])
+        && !isset($finalDocument['notes']['must-not-clobber-replacement'])
+        && glob($finalRaceRoot . '/.piplet-tmp-*.php') === [],
+        'The last pre-rename identity check did not preserve an out-of-band replacement.');
+
     $faultCopy = fixture_copy($temporaryRoot, $source, 'fault', 'Could not create the fault-injection fixture.');
     $faultRoot = dirname($faultCopy);
     $faultSource = file_get_contents($faultCopy);
@@ -1035,6 +1815,150 @@ PHP;
     check(str_contains($faultFailure['stderr'], 'Injected failure'), 'The post-temp persistence failure was not reached.');
     check(hash_file('sha256', $faultCopy) === $faultHash, 'A failed pre-rename commit changed the canonical file.');
     check(glob($faultRoot . '/.piplet-tmp-*.php') === [], 'A failed pre-rename commit left its temporary snapshot.');
+
+    // Unlike the exception tests below, these workers are killed without
+    // running finally blocks. Before rename the canonical file must remain the
+    // old complete snapshot; after rename it must be the new complete one.
+    $crashCopy = fixture_copy($temporaryRoot, $source, 'crash', 'Could not create the crash-consistency fixture.');
+    $crashRoot = dirname($crashCopy);
+    $crashSource = file_get_contents($crashCopy);
+    $syncNeedle = <<<'PHP'
+        if (!@fflush($tempHandle) || !@fsync($tempHandle)) {
+            throw new RuntimeException('Cannot sync the new snapshot.');
+        }
+PHP;
+    $syncBarrier = <<<'PHP'
+        if (!@fflush($tempHandle) || !@fsync($tempHandle)) {
+            throw new RuntimeException('Cannot sync the new snapshot.');
+        }
+        if (getenv('PIPLET_TEST_CRASH_STAGE') === 'synced') {
+            $testSignal = (string) getenv('PIPLET_TEST_CRASH_SIGNAL');
+            if ($testSignal === '' || file_put_contents($testSignal, basename($temp), LOCK_EX) === false) {
+                throw new RuntimeException('Could not signal the synced crash checkpoint.');
+            }
+            while (true) usleep(10000);
+        }
+PHP;
+    $renameNeedle = <<<'PHP'
+        $committed = true;
+        clearstatcache(true, $path);
+PHP;
+    $renameBarrier = <<<'PHP'
+        $committed = true;
+        if (getenv('PIPLET_TEST_CRASH_STAGE') === 'renamed') {
+            $testSignal = (string) getenv('PIPLET_TEST_CRASH_SIGNAL');
+            if ($testSignal === '' || file_put_contents($testSignal, 'renamed', LOCK_EX) === false) {
+                throw new RuntimeException('Could not signal the renamed crash checkpoint.');
+            }
+            while (true) usleep(10000);
+        }
+        clearstatcache(true, $path);
+PHP;
+    check(is_string($crashSource) && substr_count($crashSource, $syncNeedle) === 1
+        && substr_count($crashSource, $renameNeedle) === 1,
+        'Could not locate the crash-consistency checkpoints.');
+    $crashSource = str_replace([$syncNeedle, $renameNeedle], [$syncBarrier, $renameBarrier], $crashSource);
+    check(file_put_contents($crashCopy, $crashSource) === strlen($crashSource),
+        'Could not instrument the crash-consistency fixture.');
+    $crashHash = hash_file('sha256', $crashCopy);
+    $crashEnvironment = getenv();
+    $crashEnvironment = is_array($crashEnvironment) ? $crashEnvironment : [];
+    $crashEnvironment['PIPLET_TEST_CRASH_STAGE'] = 'synced';
+    $crashSignal = $crashRoot . '/synced.signal';
+    $crashEnvironment['PIPLET_TEST_CRASH_SIGNAL'] = $crashSignal;
+    $crashWorker = start_worker($crashCopy, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Killed before rename', 'body' => '', 'tags' => [],
+    ], $crashEnvironment);
+    for ($attempt = 0; $attempt < 400 && !is_file($crashSignal); $attempt++) usleep(5000);
+    check(is_file($crashSignal), 'The pre-rename crash worker did not reach its checkpoint.');
+    $orphanBasename = trim((string) file_get_contents($crashSignal));
+    kill_worker($crashWorker);
+    $orphan = $crashRoot . '/' . $orphanBasename;
+    clearstatcache(true, $orphan);
+    check(hash_file('sha256', $crashCopy) === $crashHash,
+        'A hard kill before rename changed the canonical snapshot.');
+    check(preg_match('/^\.piplet-tmp-[A-Za-z0-9._-]+\.php$/D', $orphanBasename) === 1
+        && is_file($orphan) && (fileperms($orphan) & 0777) === 0600,
+        'A hard kill before rename did not leave exactly the expected private snapshot.');
+    $orphanExecution = run_bounded_command([PHP_BINARY, $orphan]);
+    $orphanDocument = fixture_document_object($orphan);
+    check($orphanExecution['status'] === 0 && trim($orphanExecution['stdout']) === 'Save in progress.'
+        && isset($orphanDocument->notes->{'killed-before-rename'}) && @unlink($orphan),
+        'The synced orphan executed as an app, was incomplete, or could not be removed after inspection.');
+
+    @unlink($crashSignal);
+    $crashEnvironment['PIPLET_TEST_CRASH_STAGE'] = 'renamed';
+    $crashSignal = $crashRoot . '/renamed.signal';
+    $crashEnvironment['PIPLET_TEST_CRASH_SIGNAL'] = $crashSignal;
+    $crashWorker = start_worker($crashCopy, 'save', [
+        'id' => null, 'baseRevision' => 0, 'title' => 'Killed after rename', 'body' => '', 'tags' => [],
+    ], $crashEnvironment);
+    for ($attempt = 0; $attempt < 400 && !is_file($crashSignal); $attempt++) usleep(5000);
+    check(is_file($crashSignal), 'The post-rename crash worker did not reach its checkpoint.');
+    kill_worker($crashWorker);
+    $postCrashDocument = worker_command($crashCopy, 'read');
+    $postCrashLint = run_bounded_command([PHP_BINARY, '-l', $crashCopy]);
+    check(isset($postCrashDocument['notes']['killed-after-rename'])
+        && $postCrashLint['status'] === 0 && glob($crashRoot . '/.piplet-tmp-*.php') === [],
+        'A hard kill after rename did not leave one complete canonical snapshot.');
+
+    $ioFaultCopy = fixture_copy($temporaryRoot, $source, 'io-faults', 'Could not create the I/O fault fixture.');
+    $ioFaultRoot = dirname($ioFaultCopy);
+    $ioFaultSource = file_get_contents($ioFaultCopy);
+    $ioReplacements = [
+        <<<'PHP'
+        $handle = @fopen($temp, 'r+b');
+        $stat = $handle === false ? false : fstat($handle);
+        $pathStat = @lstat($temp);
+PHP => <<<'PHP'
+        $handle = @fopen($temp, 'r+b');
+        $stat = getenv('PIPLET_TEST_IO_FAULT') === 'fstat' ? false : ($handle === false ? false : fstat($handle));
+        $pathStat = @lstat($temp);
+PHP,
+        '$count = @fwrite($handle, $chunk);' => <<<'PHP'
+$count = getenv('PIPLET_TEST_IO_FAULT') === 'write' ? 0 : @fwrite($handle, $chunk);
+PHP,
+        'if (!@fflush($tempHandle) || !@fsync($tempHandle)) {' => <<<'PHP'
+if (getenv('PIPLET_TEST_IO_FAULT') === 'flush' || !@fflush($tempHandle)
+            || getenv('PIPLET_TEST_IO_FAULT') === 'sync-content' || !@fsync($tempHandle)) {
+PHP,
+        'if (!@chmod($temp, $mode)) {' => <<<'PHP'
+if (getenv('PIPLET_TEST_IO_FAULT') === 'chmod' || !@chmod($temp, $mode)) {
+PHP,
+        "if (!piplet_same_inode(\$tempStat, \$pathStat) || (\$pathStat['nlink'] ?? 0) !== 1\n            || !@fsync(\$tempHandle)) {" => <<<'PHP'
+if (!piplet_same_inode($tempStat, $pathStat) || ($pathStat['nlink'] ?? 0) !== 1
+            || getenv('PIPLET_TEST_IO_FAULT') === 'sync-mode' || !@fsync($tempHandle)) {
+PHP,
+        'if (!@fclose($tempHandle)) {' => <<<'PHP'
+if (getenv('PIPLET_TEST_IO_FAULT') === 'close' || !@fclose($tempHandle)) {
+PHP,
+        'if (!@rename($temp, $path)) {' => <<<'PHP'
+if (getenv('PIPLET_TEST_IO_FAULT') === 'rename' || !@rename($temp, $path)) {
+PHP,
+    ];
+    check(is_string($ioFaultSource), 'Could not read the I/O fault fixture.');
+    foreach ($ioReplacements as $ioNeedle => $ioReplacement) {
+        check(substr_count($ioFaultSource, $ioNeedle) === 1, 'Could not locate an I/O persistence checkpoint.');
+        $ioFaultSource = str_replace($ioNeedle, $ioReplacement, $ioFaultSource);
+    }
+    check(file_put_contents($ioFaultCopy, $ioFaultSource) === strlen($ioFaultSource),
+        'Could not instrument the I/O persistence checkpoints.');
+    $ioFaultHash = hash_file('sha256', $ioFaultCopy);
+    foreach (array_keys([
+        'fstat' => true, 'write' => true, 'flush' => true, 'sync-content' => true,
+        'chmod' => true, 'sync-mode' => true, 'close' => true, 'rename' => true,
+    ]) as $ioFault) {
+        $ioEnvironment = getenv();
+        $ioEnvironment = is_array($ioEnvironment) ? $ioEnvironment : [];
+        $ioEnvironment['PIPLET_TEST_IO_FAULT'] = $ioFault;
+        $ioFailure = finish_worker(start_worker($ioFaultCopy, 'save', [
+            'id' => null, 'baseRevision' => 0, 'title' => "I/O fault $ioFault", 'body' => '', 'tags' => [],
+        ], $ioEnvironment), 2);
+        check($ioFailure['stderr'] !== ''
+            && hash_file('sha256', $ioFaultCopy) === $ioFaultHash
+            && glob($ioFaultRoot . '/.piplet-tmp-*.php') === [],
+            "The $ioFault persistence failure changed the canonical file or leaked its temporary snapshot.");
+    }
 
     $modeCopy = fixture_copy($temporaryRoot, $source, 'mode', 'Could not create the mode fixture.');
     check(chmod($modeCopy, 0440), 'Could not set the mode fixture permissions.');
@@ -1077,7 +2001,16 @@ PHP;
     );
     check(hash_file('sha256', $largeCopy) === $beforeOversize, 'An over-limit save changed the canonical file.');
     check(glob($largeRoot . '/.piplet-tmp-*.php') === [], 'An over-limit save left a temporary snapshot.');
+    check($largePeak < 96 * 1024 * 1024, 'The 7+ MiB save cycle exceeded the 96 MiB worker memory envelope.');
     $largeElapsed = microtime(true) - $largeStart;
+
+    $exactFileCopy = fixture_copy($temporaryRoot, $source, 'exact-file-limit',
+        'Could not create the exact file-limit fixture.');
+    $exactFile = worker_command($exactFileCopy, 'exact-file-save');
+    check($exactFile['bytes'] === 8 * 1024 * 1024
+        && filesize($exactFileCopy) === 8 * 1024 * 1024
+        && $exactFile['bodyBytes'] > 7 * 1024 * 1024,
+        'A snapshot at the exact 8 MiB file limit was rejected or misprojected.');
 
     $savedLint = run_bounded_command([PHP_BINARY, '-l', $copy]);
     check($savedLint['status'] === 0, 'The saved piplet no longer lints.');
@@ -1085,11 +2018,12 @@ PHP;
     // Exercise the actual HTML and JSON API against another isolated copy.
     $httpCopy = fixture_copy($temporaryRoot, $source, 'http', 'Could not create the HTTP fixture.');
     $httpRoot = dirname($httpCopy);
+    $browserCapability = bin2hex(random_bytes(32));
     $browserHarness = <<<'PHP'
     <script nonce="<?= piplet_h($nonce) ?>">
     (() => {
         const browserMode = new URLSearchParams(location.search).get('__browser');
-        if (!['state', 'mobile', 'safe'].includes(browserMode)) return;
+        if (!['state', 'mobile', 'safe', 'long-path'].includes(browserMode)) return;
         const runtimeErrors = [];
         addEventListener('error', event => runtimeErrors.push(event.message || 'window error'));
         addEventListener('unhandledrejection', event => runtimeErrors.push(String(event.reason?.message || event.reason || 'unhandled rejection')));
@@ -1117,11 +2051,64 @@ PHP;
             if (!target) throw new Error(`control was missing: ${label}`);
             target.click();
         };
-        const nativeFetch = window.fetch.bind(window);
-        const progress = label => nativeFetch(`?__browser_progress=${encodeURIComponent(`${browserMode}:${label}`)}`).catch(() => null);
+        const browserFetch = window.fetch.bind(window);
+        const nativeFetch = (resource, options = {}) => {
+            const url = new URL(resource instanceof Request ? resource.url : String(resource), location.origin);
+            const headers = new Headers(options.headers || (resource instanceof Request ? resource.headers : undefined));
+            headers.set('Authorization', `Basic ${btoa('writer:browser-test')}`);
+            headers.set('X-Piplet-Test-Capability', '__PIPLET_TEST_CAPABILITY__');
+            return browserFetch(url, {...options, headers});
+        };
+        window.fetch = nativeFetch;
+        const storedDrafts = () => Object.keys(sessionStorage).flatMap(key => {
+            if (!key.includes(':draft:')) return [];
+            try {
+                const draft = JSON.parse(sessionStorage.getItem(key));
+                return draft && typeof draft === 'object' ? [{key, draft}] : [];
+            } catch (_) { return []; }
+        });
+        const progress = label => nativeFetch(`?__browser_progress=${encodeURIComponent(`${browserMode}:${label}`)}`, {method: 'POST'}).catch(() => null);
+        if (browserMode === 'long-path') {
+            const runLongPath = async () => {
+                if (sessionStorage.getItem('piplet-long-path-phase') === 'reload') {
+                    await until(() => document.getElementById('edit-title')?.value === 'Long-path recovery',
+                        'a long-path recovery record was not rediscovered after reload');
+                    assert(document.getElementById('edit-body').value === 'exact long-path draft'
+                        && storedDrafts().some(item => item.draft.title === 'Long-path recovery'),
+                        'the long-path recovery changed or disappeared');
+                    sessionStorage.removeItem('piplet-long-path-phase');
+                    return;
+                }
+                assert(location.pathname.length >= 208, 'the long-path browser scenario used a short route');
+                document.getElementById('new-button').click();
+                await until(() => document.querySelector('.editor'), 'the long-path composer did not open');
+                input(document.getElementById('edit-title'), 'Long-path recovery');
+                input(document.getElementById('edit-body'), 'exact long-path draft');
+                await until(() => storedDrafts().some(item => item.draft.title === 'Long-path recovery'),
+                    'the long-path recovery was not stored');
+                const recovery = storedDrafts().find(item => item.draft.title === 'Long-path recovery');
+                assert(recovery.key.length > 256 && /:draft:v2:[a-f0-9]{32}$/.test(recovery.key),
+                    'the long-path test did not cross the former absolute key limit');
+                sessionStorage.setItem('piplet-long-path-phase', 'reload');
+                await progress('reload');
+                location.reload();
+                await new Promise(() => {});
+            };
+            runLongPath().then(async () => {
+                result.textContent = 'PASS'; document.body.append(result);
+                await progress('result:PASS');
+            }).catch(async error => {
+                const message = String(error.stack || error.message).replace(/\s+/g, ' ');
+                result.textContent = `FAIL: ${message}`; document.body.append(result);
+                await progress(`result:FAIL: ${message}`);
+            });
+            return;
+        }
         if (browserMode === 'safe') {
             const runSafe = async () => {
-                const state = JSON.parse(document.getElementById('piplet-state').textContent);
+                const encoded = document.getElementById('piplet-state').textContent.trim();
+                const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+                const state = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes));
                 assert(state.safeAppearance && state.appearance.customCss, 'safe mode lost the stored custom CSS');
                 assert(document.getElementById('piplet-custom-style').textContent === '', 'safe mode applied stored custom CSS');
                 assert(document.querySelector('.safe-appearance'), 'safe mode did not explain how to recover');
@@ -1136,7 +2123,7 @@ PHP;
                 await until(() => !document.getElementById('appearance-dialog').open, 'safe mode could not clear custom CSS');
                 assert(document.getElementById('piplet-custom-style').textContent === '', 'safe mode applied CSS while clearing it');
                 const snapshot = await nativeFetch('?download=1').then(response => response.text());
-                const marker = '\nPIPLET-DATA/1\n';
+                const marker = '\nPIPLET-DATA/2\n';
                 const documentState = JSON.parse(snapshot.slice(snapshot.lastIndexOf(marker) + marker.length).trim());
                 assert(documentState.appearance.customCss === '', 'safe mode did not persist the cleared CSS');
                 if (runtimeErrors.length) throw new Error(`safe-mode page error: ${runtimeErrors.join('; ')}`);
@@ -1209,11 +2196,29 @@ PHP;
         }
         const run = async () => {
             const csrf = document.querySelector('meta[name="piplet-csrf"]').content;
-            const api = (action, payload) => nativeFetch(`?api=${action}`, {
-                method: 'POST', credentials: 'same-origin',
-                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
-                body: JSON.stringify(payload)
-            });
+            const downloadDocument = async () => {
+                const snapshot = await nativeFetch('?download=1').then(response => response.text());
+                const marker = '\nPIPLET-DATA/2\n';
+                return JSON.parse(snapshot.slice(snapshot.lastIndexOf(marker) + marker.length).trim());
+            };
+            const api = async (action, payload) => {
+                const document = await downloadDocument();
+                const prepared = {...payload, baseGeneration: document.generation};
+                if (action === 'appearance') {
+                    prepared.baseVersion = document.appearance.version;
+                } else if (payload.id === null) {
+                    prepared.baseVersion = null;
+                    prepared.createToken ||= 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+                } else if (document.notes[payload.id]) {
+                    prepared.baseVersion = document.notes[payload.id].version;
+                    if (action === 'save') prepared.createToken = null;
+                }
+                return nativeFetch(`?api=${action}`, {
+                    method: 'POST', credentials: 'same-origin',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+                    body: JSON.stringify(prepared)
+                });
+            };
             const findLibraryItem = async title => {
                 input(document.getElementById('search-input'), title);
                 await until(() => [...document.querySelectorAll('.library-item')].some(node => node.querySelector('.library-title')?.textContent === title), `library search did not find ${title}`);
@@ -1224,264 +2229,193 @@ PHP;
                 && document.getElementById('global-status').getAttribute('role') === 'status',
                 'the header started with stale status copy or lost its live-region semantics');
             assert(!document.getElementById('file-size'), 'the idle header displayed file metadata');
-            if (sessionStorage.getItem('piplet-browser-phase') === 'read-only') {
-                await until(() => document.querySelector('.plain-note[aria-label="Recovered draft text"]'), 'read-only page did not expose its browser draft');
-                const expectedRecoveries = new Map([
-                    ['Read-only recovery', {body: 'copy this text while the file is read-only', tag: 'first-tag'}],
-                    ['Second recovery', {body: '', tag: 'tag-only-change'}]
-                ]);
-                const assertRecovery = () => {
-                    const title = document.querySelector('.editor h2').textContent;
-                    const expected = expectedRecoveries.get(title);
-                    assert(expected, `read-only recovery exposed an unexpected draft: ${title}`);
-                    assert(document.querySelector('.plain-note').value === expected.body, `read-only recovery lost the body for ${title}`);
-                    assert(document.querySelector('.editor .note-meta')?.textContent.includes(expected.tag), `read-only recovery omitted unsaved tags for ${title}`);
-                    return title;
+            if (sessionStorage.getItem('piplet-browser-phase') === 'writable-setup') {
+                await progress('writable-setup:entered');
+                const welcome = await findLibraryItem('Hello, piplet');
+                welcome.click();
+                await until(() => document.getElementById('piplet-note-welcome'),
+                    'welcome did not open for writable recovery setup');
+                click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'),
+                    'edit welcome for writable reload recovery');
+                await until(() => document.querySelector('#piplet-note-welcome.editor'),
+                    'welcome editor did not open for writable recovery setup');
+                input(document.getElementById('edit-title'), 'Writable reload recovery');
+                input(document.getElementById('edit-body'), 'exact writable recovery body');
+                input(document.getElementById('edit-tags'), '["reload","exact"]');
+                window.dispatchEvent(new Event('pagehide'));
+                const recovery = storedDrafts().find(item => item.draft.title === 'Writable reload recovery');
+                assert(recovery && /:draft:v2:[a-f0-9]{32}$/.test(recovery.key),
+                    'the existing-note recovery was not flushed before reload');
+                const beforeRemote = await downloadDocument();
+                const current = beforeRemote.notes.welcome;
+                const remote = await api('save', {
+                    id: 'welcome', baseRevision: current.revision, title: current.title,
+                    body: 'saved remotely before writable recovery reload', tags: current.tags
+                });
+                assert(remote.ok, 'the competing writable-reload save failed');
+                sessionStorage.setItem('piplet-browser-phase', 'writable-existing');
+                await progress('writable-setup:reload');
+                location.reload();
+                await new Promise(() => {});
+            }
+            if (sessionStorage.getItem('piplet-browser-phase') === 'writable-existing') {
+                await progress('writable-existing:entered');
+                await until(() => document.querySelector('#piplet-note-welcome.editor .conflict-panel'),
+                    'an existing-note recovery was not surfaced automatically after reload');
+                assert(document.getElementById('edit-title').value === 'Writable reload recovery'
+                    && document.getElementById('edit-body').value === 'exact writable recovery body'
+                    && document.getElementById('edit-tags').value === '["reload","exact"]',
+                    'writable startup changed or hid the existing-note recovery');
+                const recovered = storedDrafts().find(item => item.draft.title === 'Writable reload recovery');
+                assert(recovered && /:draft:v2:[a-f0-9]{32}$/.test(recovered.key),
+                    'the writable reload did not retain its random recovery record');
+                button(document.querySelector('.conflict-panel'), 'Use saved version').click();
+                await until(() => !document.querySelector('.editor'),
+                    'the writable existing-note recovery did not resolve explicitly');
+                assert(sessionStorage.getItem(recovered.key) === null,
+                    'resolving the writable existing-note recovery left its record behind');
+
+                const lineageWelcome = await findLibraryItem('Hello, piplet');
+                lineageWelcome.click();
+                await until(() => document.getElementById('piplet-note-welcome'),
+                    'welcome did not open for the restored-lineage reload test');
+                click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'),
+                    'edit welcome for restored-lineage reload recovery');
+                await until(() => document.querySelector('#piplet-note-welcome.editor'),
+                    'the restored-lineage reload editor did not open');
+                input(document.getElementById('edit-title'), 'Writable lineage recovery');
+                input(document.getElementById('edit-body'), 'draft from the pre-rekey browser lineage');
+                input(document.getElementById('edit-tags'), '["lineage","reload"]');
+                window.dispatchEvent(new Event('pagehide'));
+                const lineageRecovery = storedDrafts().find(item => item.draft.title === 'Writable lineage recovery');
+                assert(lineageRecovery, 'the pre-rekey browser draft was not stored');
+                const rekey = await nativeFetch('?__browser_rekey=1', {method: 'POST'});
+                assert(rekey.status === 204, 'the browser fixture could not rekey its saved document');
+                sessionStorage.setItem('piplet-browser-phase', 'writable-lineage');
+                await progress('writable-existing:reload-lineage');
+                location.reload();
+                await new Promise(() => {});
+            }
+            if (sessionStorage.getItem('piplet-browser-phase') === 'writable-lineage') {
+                await progress('writable-lineage:entered');
+                await until(() => document.querySelector('.conflict-panel')?.textContent.includes('earlier restored copy'),
+                    'a recovered old-generation draft was downgraded to an ordinary conflict after reload');
+                const choices = [...document.querySelectorAll('.conflict-panel button')].map(item => item.textContent.trim());
+                assert(document.getElementById('edit-title').value === 'Writable lineage recovery'
+                    && document.getElementById('edit-body').value === 'draft from the pre-rekey browser lineage'
+                    && choices.includes('Save as new in this piplet') && !choices.includes('Replace saved version'),
+                    'the restored-lineage recovery could overwrite restored content after reload');
+                const recovery = storedDrafts().find(item => item.draft.title === 'Writable lineage recovery');
+                assert(recovery, 'the restored-lineage recovery record disappeared before resolution');
+                button(document.querySelector('.conflict-panel'), 'Save as new in this piplet').click();
+                await until(() => !document.querySelector('.conflict-panel'),
+                    'the restored-lineage recovery did not rebase as a new note');
+                document.querySelector('.editor form').requestSubmit();
+                await until(() => !document.querySelector('.editor'),
+                    'the restored-lineage recovery did not save as a new note');
+                const saved = await downloadDocument();
+                const adopted = Object.values(saved.notes).find(note => note.title === 'Writable lineage recovery');
+                assert(saved.notes.welcome.body === 'saved remotely before writable recovery reload'
+                    && adopted?.body === 'draft from the pre-rekey browser lineage'
+                    && JSON.stringify(adopted?.tags) === '["lineage","reload"]'
+                    && sessionStorage.getItem(recovery.key) === null,
+                    'saving the restored-lineage recovery changed restored content or left its draft behind');
+                sessionStorage.setItem('piplet-browser-phase', 'flat-read-only');
+                await progress('writable-lineage:reload-flat-read-only');
+                location.reload();
+                await new Promise(() => {});
+            }
+            if (sessionStorage.getItem('piplet-browser-phase') === 'flat-read-only-final') {
+                await progress('flat-read-only-final:entered');
+                await until(() => document.querySelector('.plain-note[aria-label="Recovered draft text"]'),
+                    'read-only mode did not expose the immutable recovery record');
+                const recoveredValues = {
+                    title: document.querySelector('[aria-label="Recovered draft title"]')?.value,
+                    body: document.querySelector('.plain-note').value,
+                    tags: document.querySelector('[aria-label="Recovered draft tags JSON"]')?.value
                 };
-                const firstRecovery = assertRecovery();
-                await progress(`read-only:first:${firstRecovery}`);
-                assert(![...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'Save note'), 'read-only recovery exposed a server save action');
-                const exerciseFailedDismissal = title => {
-                    const recoveryKey = Object.keys(sessionStorage).find(key => {
-                        try { return JSON.parse(sessionStorage.getItem(key))?.title === title; }
-                        catch (_) { return false; }
-                    });
-                    const staleKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:stale-migration'));
-                    const blockedKey = title === 'Read-only recovery' ? staleKey : recoveryKey;
-                    assert(recoveryKey && blockedKey, `could not identify recovery storage for ${title}`);
-                    const removeItem = Storage.prototype.removeItem;
-                    const setItem = Storage.prototype.setItem;
-                    Storage.prototype.removeItem = function (key) {
-                        if (key === blockedKey) throw new DOMException('blocked', 'SecurityError');
-                        return removeItem.call(this, key);
-                    };
-                    Storage.prototype.setItem = function (key, value) {
-                        if (key === blockedKey) throw new DOMException('blocked', 'SecurityError');
-                        return setItem.call(this, key, value);
-                    };
-                    try {
-                        button(document.querySelector('.editor'), 'Dismiss recovery').click();
-                        assert(sessionStorage.getItem(recoveryKey) !== null, `failed dismissal erased the authoritative recovery for ${title}`);
-                        assert(document.querySelector('.plain-note'), 'failed read-only dismissal hid the only recovery copy');
-                        assert(document.querySelector('.save-status').textContent.includes('could not clear'), 'failed read-only dismissal was not reported');
-                    } finally {
-                        Storage.prototype.removeItem = removeItem;
-                        Storage.prototype.setItem = setItem;
-                    }
+                assert(recoveredValues.title === '  Exact recovery title  '
+                    && recoveredValues.body === 'exact recovery body\nwith a second line'
+                    && recoveredValues.tags === '["comma, tag"," spaced ","line\\nbreak"]',
+                    `read-only recovery changed title, body, or tags: ${JSON.stringify(recoveredValues)}`);
+                assert(![...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'Save note'),
+                    'read-only recovery exposed a server write action');
+                const recovery = storedDrafts().find(item => item.draft.title === '  Exact recovery title  ');
+                assert(recovery && /:draft:v2:[a-f0-9]{32}$/.test(recovery.key),
+                    'recovery was not stored under a random v2 key');
+                const removeItem = Storage.prototype.removeItem;
+                const setItem = Storage.prototype.setItem;
+                Storage.prototype.removeItem = function (key) {
+                    if (key === recovery.key) throw new DOMException('blocked', 'SecurityError');
+                    return removeItem.call(this, key);
                 };
-                exerciseFailedDismissal(firstRecovery);
-                await progress('read-only:storage-restored');
+                Storage.prototype.setItem = function (key, value) {
+                    if (key === recovery.key) throw new DOMException('blocked', 'SecurityError');
+                    return setItem.call(this, key, value);
+                };
                 button(document.querySelector('.editor'), 'Dismiss recovery').click();
-                await progress('read-only:first-dismissed');
-                await until(() => document.querySelector('.editor h2')?.textContent !== firstRecovery, 'read-only recovery did not advance to the next draft');
-                await progress('read-only:advanced');
-                const secondRecovery = assertRecovery();
-                await progress(`read-only:second:${secondRecovery}`);
-                assert(secondRecovery !== firstRecovery, 'read-only recovery repeated the same draft');
-                await until(() => document.querySelector('.editor')?.contains(document.activeElement), 'the next recovery did not receive keyboard focus');
-                exerciseFailedDismissal(secondRecovery);
+                assert(sessionStorage.getItem(recovery.key) !== null && document.querySelector('.plain-note'),
+                    'a failed compare-and-delete discarded the only recovery copy');
+                Storage.prototype.removeItem = removeItem;
+                Storage.prototype.setItem = setItem;
                 button(document.querySelector('.editor'), 'Dismiss recovery').click();
-                await until(() => !document.querySelector('.plain-note[aria-label="Recovered draft text"]'), 'read-only recoveries did not finish after explicit dismissal');
-                assert(!Object.keys(sessionStorage).some(key => key.includes('draft:stale-migration')), 'read-only dismissal left a linked stale recovery copy');
-                assert(sessionStorage.getItem('piplet-browser-foreign') === 'keep me', 'a recovery link cleared unrelated session storage');
-                const malformedKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:bad-json'));
-                assert(malformedKey && sessionStorage.getItem(malformedKey) === '{', 'a malformed recovery hid valid drafts or was deleted');
-                sessionStorage.removeItem(malformedKey);
+                await until(() => !document.querySelector('.plain-note[aria-label="Recovered draft text"]'),
+                    'read-only recovery did not dismiss after storage recovered');
+                assert(sessionStorage.getItem(recovery.key) === null,
+                    'dismissal left its exact immutable record behind');
+                assert(sessionStorage.getItem('piplet-browser-foreign') === 'keep me',
+                    'draft metadata deleted an unrelated session-storage key');
+                const malformed = Object.keys(sessionStorage).find(key => key.endsWith(':draft:malformed'));
+                assert(malformed && sessionStorage.getItem(malformed) === '{',
+                    'a malformed sibling record was treated as recovery authority');
+                sessionStorage.removeItem(malformed);
                 sessionStorage.removeItem('piplet-browser-foreign');
-                await until(() => document.activeElement === document.getElementById('main'), 'focus was not restored after the final recovery');
                 sessionStorage.removeItem('piplet-browser-phase');
-                await progress('read-only:done');
+                await progress('flat-read-only-final:done');
                 return;
             }
-            if (sessionStorage.getItem('piplet-browser-phase') === 'orphan') {
-                await progress('orphan:entered');
-                await until(() => document.querySelector('.conflict-panel'), 'deleted-note draft was not recovered after reload');
-                assert(document.getElementById('edit-body').value === 'orphaned after remote delete',
-                    `orphan recovery lost the draft text (opened ${document.getElementById('edit-title').value})`);
-                sessionStorage.removeItem('piplet-browser-phase');
-                const currentOrphanKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:welcome'));
-                const staleOrphanKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:older-welcome'));
-                assert(currentOrphanKey && staleOrphanKey, 'the chained writable-orphan fixture was incomplete');
-                const orphanRemoveItem = Storage.prototype.removeItem;
-                const orphanSetItem = Storage.prototype.setItem;
-                Storage.prototype.removeItem = function (key) {
-                    if (key === staleOrphanKey) throw new DOMException('blocked', 'SecurityError');
-                    return orphanRemoveItem.call(this, key);
-                };
-                Storage.prototype.setItem = function (key, value) {
-                    if (key === staleOrphanKey) throw new DOMException('blocked', 'SecurityError');
-                    return orphanSetItem.call(this, key, value);
-                };
-                button(document.querySelector('.conflict-panel'), 'Discard draft').click();
-                assert(sessionStorage.getItem(currentOrphanKey) !== null, 'failed writable-orphan cleanup deleted the authoritative recovery first');
-                assert(document.querySelector('.editor'), 'failed writable-orphan cleanup closed its only current copy');
-                assert(document.querySelector('.save-status').textContent.includes('could not discard'), 'failed writable-orphan cleanup was not reported');
-                Storage.prototype.removeItem = orphanRemoveItem;
-                Storage.prototype.setItem = orphanSetItem;
-                button(document.querySelector('.conflict-panel'), 'Discard draft').click();
-                await until(() => !document.querySelector('.editor'), 'orphan draft did not close after explicit discard');
-                assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:welcome') || key.endsWith('draft:older-welcome')), 'discard left a chained orphan recovery key behind');
-                await until(() => document.activeElement === document.getElementById('new-button'), 'discard did not restore keyboard focus');
-                document.getElementById('new-button').click();
-                await until(() => document.querySelector('.editor'), 'read-only recovery draft did not open');
-                input(document.getElementById('edit-title'), 'Read-only recovery');
-                input(document.getElementById('edit-body'), 'copy this text while the file is read-only');
-                input(document.getElementById('edit-tags'), 'first-tag');
-                window.dispatchEvent(new Event('pagehide'));
-                const newDraftKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:@new'));
-                assert(newDraftKey, 'first read-only recovery draft was not stored');
-                const draftPrefix = newDraftKey.slice(0, -4);
-                const staleMigrationKey = draftPrefix + 'stale-migration';
-                const secondStaleMigrationKey = draftPrefix + 'stale-migration-2';
-                sessionStorage.setItem(staleMigrationKey, JSON.stringify({
-                    id: 'stale-migration', baseRevision: 1, title: 'Stale migration copy', body: 'older text', tags: ['stale'],
-                    previousDraftKeys: [secondStaleMigrationKey]
-                }));
-                sessionStorage.setItem(secondStaleMigrationKey, JSON.stringify({
-                    id: 'stale-migration-2', baseRevision: 1, title: 'Second stale migration copy', body: 'oldest text', tags: ['stale']
-                }));
-                const currentRecovery = JSON.parse(sessionStorage.getItem(newDraftKey));
-                currentRecovery.previousDraftKey = staleMigrationKey;
-                sessionStorage.setItem(newDraftKey, JSON.stringify(currentRecovery));
-                sessionStorage.setItem(draftPrefix + 'bad-json', '{');
-                sessionStorage.setItem('piplet-browser-foreign', 'keep me');
-                sessionStorage.setItem(draftPrefix + 'story-cap-0', JSON.stringify({
-                    id: 'story-cap-0', baseRevision: 1, title: 'Second recovery', body: '', tags: ['tag-only-change'],
-                    previousDraftKey: 'piplet-browser-foreign'
-                }));
-                const madeReadOnly = await nativeFetch('?__browser_readonly=1');
-                assert(madeReadOnly.ok, 'test fixture could not become read-only');
-                assert(runtimeErrors.length === 0, `page error before read-only reload: ${runtimeErrors.join('; ')}`);
-                sessionStorage.setItem('piplet-browser-phase', 'read-only');
-                await progress('orphan:reload-read-only');
-                const reloadSetItem = Storage.prototype.setItem;
-                Storage.prototype.setItem = function (key, value) {
-                    if (key === newDraftKey) return;
-                    return reloadSetItem.call(this, key, value);
-                };
-                location.reload();
-                await new Promise(() => {});
-            }
-            if (sessionStorage.getItem('piplet-browser-phase') === 'superseded-orphan') {
-                await progress('superseded-orphan:entered');
-                await until(() => document.querySelector('.editor'), 'writable startup did not open its pending recovery migration');
-                assert(document.getElementById('edit-title').value === 'Authoritative recovery'
-                    && document.getElementById('edit-body').value === 'latest text',
-                    'writable startup selected the superseded orphan instead of its authoritative draft');
-                const staleKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:synthetic-orphan'));
-                const oldestKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:synthetic-oldest'));
-                const authoritativeKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:@new'));
-                assert(staleKey && oldestKey && authoritativeKey, 'superseded-orphan fixture did not survive reload');
-                button(document.querySelector('.editor-actions'), 'Cancel').click();
-                await until(() => !document.querySelector('.editor'), 'pending recovery migration did not close after explicit discard');
-                assert(!sessionStorage.getItem(staleKey) && !sessionStorage.getItem(oldestKey) && !sessionStorage.getItem(authoritativeKey), 'pending recovery migration did not clear its linked copies');
-
-                const draftPrefix = authoritativeKey.slice(0, -4);
-                const componentOwnerKey = `${draftPrefix}story-cap-0`;
-                const componentPredecessorKey = `${draftPrefix}story-cap-1`;
-                sessionStorage.setItem(componentPredecessorKey, JSON.stringify({
-                    id: 'story-cap-1', baseRevision: 0, title: 'Stale component', body: 'older component text', tags: ['stale']
-                }));
-                sessionStorage.setItem(componentOwnerKey, JSON.stringify({
-                    id: 'story-cap-0', baseRevision: 0, title: 'Authoritative component', body: 'latest component text', tags: ['current'],
-                    previousDraftKeys: [componentPredecessorKey]
-                }));
-                const predecessorItem = await findLibraryItem('Story cap 1');
-                predecessorItem.click();
-                await until(() => document.getElementById('piplet-note-story-cap-1'), 'the predecessor note did not open');
-                click(document.querySelector('#piplet-note-story-cap-1 button[title="Edit note"]'), 'edit a reserved predecessor key');
-                await until(() => document.querySelector('#piplet-note-story-cap-0.editor'), 'Edit did not prioritize the pending recovery owner');
-                assert(document.getElementById('edit-title').value === 'Authoritative component', 'Edit opened stale predecessor text instead of its owner');
-                button(document.querySelector('.conflict-panel'), 'Use saved version').click();
-                await until(() => !document.querySelector('.editor'), 'the pending edit owner did not close');
-                assert(!sessionStorage.getItem(componentOwnerKey) && !sessionStorage.getItem(componentPredecessorKey), 'the pending edit component was not cleared');
-
-                const danglingOwnerKey = `${draftPrefix}story-cap-0`;
-                sessionStorage.setItem(danglingOwnerKey, JSON.stringify({
-                    id: 'story-cap-0', baseRevision: 0, title: 'Dangling-link owner', body: 'current recovery text', tags: ['recovery'],
-                    previousDraftKeys: [`${draftPrefix}already-removed`]
-                }));
-                document.getElementById('new-button').click();
-                await until(() => document.querySelector('#piplet-note-story-cap-0.editor'), 'a dangling recovery link did not reopen its owner');
-                assert(document.getElementById('edit-title').value === 'Dangling-link owner', 'a dangling recovery link allowed its fixed key to be reused');
-                button(document.querySelector('.conflict-panel'), 'Use saved version').click();
-                await until(() => !document.querySelector('.editor'), 'dangling-link owner did not close after choosing the saved version');
-                assert(!sessionStorage.getItem(danglingOwnerKey), 'dangling-link owner recovery was not cleared');
-
+            if (sessionStorage.getItem('piplet-browser-phase') === 'flat-read-only') {
+                await progress('flat-read-only:entered');
+                assert(document.querySelectorAll('.library-item').length === 40,
+                    'the library DOM exceeded its bounded window');
+                for (const {key} of storedDrafts()) sessionStorage.removeItem(key);
                 const welcomeItem = await findLibraryItem('Hello, piplet');
-                assert(welcomeItem, 'welcome note was missing before story-cap recovery');
                 welcomeItem.click();
-                click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'story-cap welcome edit');
-                await until(() => document.querySelector('#piplet-note-welcome.editor'), 'story-cap editor did not open');
-                input(document.getElementById('edit-body'), 'orphaned after remote delete');
-                for (let index = 0; index < 25; index++) {
-                    const title = `Story cap ${index}`;
-                    const item = await findLibraryItem(title);
-                    assert(item, `story-cap note ${index} was missing from the library`);
-                    item.click();
-                }
-                assert(document.querySelectorAll('#story > article').length <= 20, 'the story rendered more than 20 open notes');
-                assert(document.querySelector('#piplet-note-welcome.editor') && document.getElementById('edit-body').value === 'orphaned after remote delete', 'the story cap evicted the live editor');
-                const openKey = Object.keys(sessionStorage).find(key => key.endsWith(':open'));
-                assert(openKey && JSON.parse(sessionStorage.getItem(openKey)).length <= 20, 'the persisted open-note set exceeded its cap');
+                await until(() => document.getElementById('piplet-note-welcome'), 'welcome did not open for recovery setup');
+                click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'edit welcome for recovery setup');
+                await until(() => document.querySelector('#piplet-note-welcome.editor'), 'recovery editor did not open');
+                input(document.getElementById('edit-title'), '  Exact recovery title  ');
+                input(document.getElementById('edit-body'), 'exact recovery body\nwith a second line');
+                input(document.getElementById('edit-tags'), '["comma, tag"," spaced ","line\\nbreak"]');
                 window.dispatchEvent(new Event('pagehide'));
-                const welcomeDraftKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:welcome'));
-                assert(welcomeDraftKey, 'the current orphan-recovery draft was not stored');
-                const olderWelcomeKey = welcomeDraftKey.slice(0, -7) + 'older-welcome';
-                sessionStorage.setItem(olderWelcomeKey, JSON.stringify({
-                    id: 'older-welcome', baseRevision: 1, title: 'Older welcome recovery', body: 'older orphan text', tags: ['stale']
-                }));
-                const welcomeDraft = JSON.parse(sessionStorage.getItem(welcomeDraftKey));
-                welcomeDraft.previousDraftKeys = [olderWelcomeKey];
-                sessionStorage.setItem(welcomeDraftKey, JSON.stringify(welcomeDraft));
-                const snapshot = await nativeFetch('?download=1').then(response => response.text());
-                const marker = '\nPIPLET-DATA/1\n';
-                const markerAt = snapshot.lastIndexOf(marker);
-                assert(markerAt >= 0, 'downloaded snapshot data marker was missing');
-                const snapshotDocument = JSON.parse(snapshot.slice(markerAt + marker.length).trim());
-                const removed = await api('delete', {id: 'welcome', baseRevision: snapshotDocument.notes.welcome.revision});
-                assert(removed.ok, 'remote delete for orphan recovery failed');
-                assert(runtimeErrors.length === 0, `page error before orphan reload: ${runtimeErrors.join('; ')}`);
-                sessionStorage.setItem('piplet-browser-phase', 'orphan');
-                await progress('superseded-orphan:reload-orphan');
-                const orphanReloadSetItem = Storage.prototype.setItem;
-                Storage.prototype.setItem = function (key, value) {
-                    if (key === welcomeDraftKey) return;
-                    return orphanReloadSetItem.call(this, key, value);
-                };
+                const recovery = storedDrafts().find(item => item.draft.title === '  Exact recovery title  ');
+                assert(recovery && recovery.draft.tagsText === '["comma, tag"," spaced ","line\\nbreak"]',
+                    'the browser recovery record did not preserve exact editable values');
+                recovery.draft.previousDraftKeys = ['piplet-browser-foreign'];
+                sessionStorage.setItem(recovery.key, JSON.stringify(recovery.draft));
+                const scope = recovery.key.slice(0, recovery.key.indexOf('draft:'));
+                sessionStorage.setItem(`${scope}draft:malformed`, '{');
+                sessionStorage.setItem('piplet-browser-foreign', 'keep me');
+                const madeReadOnly = await nativeFetch('?__browser_readonly=1', {method: 'POST'});
+                assert(madeReadOnly.ok, 'test fixture could not become read-only');
+                sessionStorage.setItem('piplet-browser-phase', 'flat-read-only-final');
+                await progress('flat-read-only:reload');
                 location.reload();
                 await new Promise(() => {});
             }
-            if (sessionStorage.getItem('piplet-browser-phase') === 'story-cap') {
-                await progress('story-cap:entered');
-                assert(document.querySelectorAll('.library-item').length === 40, 'the library DOM exceeded its 40-note window');
-                assert(document.querySelector('.library-empty')?.textContent.includes('Refine the search'), 'the capped library did not explain how to find older notes');
-                const openKey = Object.keys(sessionStorage).find(key => key.endsWith(':open'));
-                assert(openKey, 'the story-cap open-note state was missing');
-                const scope = openKey.slice(0, -4);
-                const oldestKey = `${scope}draft:synthetic-oldest`;
-                const staleKey = `${scope}draft:synthetic-orphan`;
-                const authoritativeKey = `${scope}draft:@new`;
-                sessionStorage.setItem(oldestKey, JSON.stringify({
-                    id: 'synthetic-oldest', baseRevision: 1, title: 'Oldest orphan', body: 'oldest text', tags: ['stale']
-                }));
-                sessionStorage.setItem(staleKey, JSON.stringify({
-                    id: 'synthetic-orphan', baseRevision: 1, title: 'Superseded orphan', body: 'stale text', tags: ['stale'],
-                    previousDraftKeys: [oldestKey]
-                }));
-                sessionStorage.setItem(authoritativeKey, JSON.stringify({
-                    id: null, baseRevision: 0, createToken: 'ffffffffffffffffffffffffffffffff',
-                    title: 'Authoritative recovery', body: 'latest text', tags: ['current'],
-                    previousDraftKeys: [staleKey]
-                }));
-                sessionStorage.setItem('piplet-browser-phase', 'superseded-orphan');
-                await progress('story-cap:reload-superseded-orphan');
-                location.reload();
-                await new Promise(() => {});
-            }
-
-            const hostileItem = await findLibraryItem('HTTP note');
             await progress('main:entered');
+            assert(document.querySelectorAll('.library-item').length === 40
+                && document.querySelector('.library-empty')?.textContent.includes('Refine the search'),
+                'the live library exceeded its bounded window or hid older-note search guidance');
+            for (let index = 0; index < 21; index++) {
+                const item = await findLibraryItem(`Story cap ${index}`);
+                assert(item, `story-cap note ${index} was missing`);
+                item.click();
+            }
+            assert(document.querySelectorAll('#story > article').length <= 20,
+                'the live story rendered more than 20 open notes');
+            input(document.getElementById('search-input'), '');
+            const hostileItem = await findLibraryItem('HTTP note');
             assert(hostileItem, 'hostile-content note was missing from the browser fixture');
             hostileItem.click();
             const hostileNote = document.getElementById('piplet-note-http-note');
@@ -1579,9 +2513,14 @@ PHP;
             await until(() => document.querySelector('.editor'), 'new-note editor did not open');
             assert(document.querySelector('.editor-preview > h2.preview-label')?.textContent === 'Live preview',
                 'the editor preview did not preserve a level-two heading above rendered note headings');
-            input(document.getElementById('edit-title'), 'One browser save');
+            input(document.getElementById('edit-title'), '😀'.repeat(61));
             input(document.getElementById('edit-body'), 'typed before the request');
             const firstForm = document.querySelector('.editor form');
+            firstForm.requestSubmit();
+            assert(saveCalls === 0
+                && document.querySelector('.save-status')?.textContent.includes('240 UTF-8 bytes'),
+                'the editor sent a multibyte title that exceeds the server byte limit');
+            input(document.getElementById('edit-title'), 'One browser save');
             firstForm.requestSubmit();
             firstForm.requestSubmit();
             document.dispatchEvent(new KeyboardEvent('keydown', {key: 's', ctrlKey: true, bubbles: true}));
@@ -1600,7 +2539,11 @@ PHP;
                 return nativeStatusTimeout.call(this, callback, delay, ...args);
             };
             releaseSave();
-            await until(() => [...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save'), 'saved note did not render');
+            await until(() => [...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save')
+                || document.querySelector('.save-status')?.dataset.kind === 'error',
+                'saved note did not render or report its failure');
+            assert([...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save'),
+                `saved note did not render: ${document.querySelector('.save-status')?.textContent || 'no editor status'}`);
             window.setTimeout = nativeStatusTimeout;
             assert(saveCalls === 1, 'one user save created multiple requests');
             const savedStatus = document.getElementById('global-status').textContent;
@@ -1610,132 +2553,81 @@ PHP;
             assert(document.getElementById('global-status').textContent === '', 'the expired save notice left stale header context');
             window.fetch = nativeFetch;
 
+            const legacyGeneration = (await downloadDocument()).generation;
+            const legacyRecoveryKey = `piplet:${location.pathname}:draft:legacy-security-audit`;
+            const malformedUtf16Body = `migrate [[broken|${String.fromCharCode(0xd800)}]] exactly`;
+            const repairedUtf16Body = 'migrate [[broken|�]] exactly';
+            sessionStorage.setItem(legacyRecoveryKey, JSON.stringify({
+                id: null, baseGeneration: legacyGeneration, baseRevision: 7,
+                baseVersion: 'cccccccccccccccccccccccccccccccc',
+                createToken: 'abababababababababababababababab', title: 'Legacy recovery migration',
+                body: malformedUtf16Body, tags: ['legacy'], tagsText: '["legacy"]'
+            }));
+            document.getElementById('new-button').click();
+            await until(() => document.getElementById('edit-title')?.value === 'Legacy recovery migration',
+                'a legacy recovery record did not open');
+            assert(document.getElementById('edit-body').value === repairedUtf16Body,
+                'malformed UTF-16 was not repaired into savable Unicode');
+            await until(() => storedDrafts().some(item => item.draft.title === 'Legacy recovery migration'
+                && item.draft.recoveryFormat === 2), 'a legacy recovery record did not migrate');
+            const migratedRecovery = storedDrafts().find(item => item.draft.title === 'Legacy recovery migration'
+                && item.draft.recoveryFormat === 2);
+            assert(migratedRecovery.key !== legacyRecoveryKey
+                && /:draft:v2:[a-f0-9]{32}$/.test(migratedRecovery.key)
+                && /^[a-f0-9]{32}$/.test(migratedRecovery.draft.draftId)
+                && /^[a-f0-9]{32}$/.test(migratedRecovery.draft.storageVersion)
+                && migratedRecovery.draft.baseRevision === 0
+                && migratedRecovery.draft.baseVersion === null
+                && migratedRecovery.draft.body === repairedUtf16Body
+                && sessionStorage.getItem(legacyRecoveryKey) === null,
+                'legacy recovery migration did not normalize an immutable, savable record');
+            document.querySelector('.editor form').requestSubmit();
+            await until(() => [...document.querySelectorAll('.note-title')]
+                .some(node => node.textContent === 'Legacy recovery migration'),
+                'the normalized recovery record could not be saved');
+            const repairedDocument = await downloadDocument();
+            const repairedNote = Object.values(repairedDocument.notes)
+                .find(note => note.title === 'Legacy recovery migration');
+            assert(repairedNote?.body === repairedUtf16Body,
+                'saving the normalized recovery changed its repaired text');
+            assert(sessionStorage.getItem(migratedRecovery.key) === null,
+                'saving the migrated recovery left its random record behind');
+
+
             document.getElementById('new-button').click();
             await until(() => document.getElementById('piplet-composer'), 'the slug-collision note composer did not open');
             input(document.getElementById('edit-title'), 'new');
             input(document.getElementById('edit-body'), 'saved body for the real new slug');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.getElementById('piplet-note-new') && !document.querySelector('.editor'), 'a note whose slug is new did not save');
-            assert(document.querySelectorAll('#piplet-note-new').length === 1 && document.querySelectorAll('#note-count').length === 1,
-                'a saved note collided with a fixed page element ID');
-            assert(/saved/i.test(document.getElementById('global-status').textContent)
-                && document.getElementById('global-status').textContent.includes('new'),
-                'the new-slug save notice was not contextual');
+            await until(() => document.getElementById('piplet-note-new') && !document.querySelector('.editor'),
+                'a note whose slug is new did not save');
             click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit the real new-slug note');
-            assert(document.getElementById('global-status').textContent === '', 'clicking into a note left the prior save notice visible');
             await until(() => document.querySelector('#piplet-note-new.editor'), 'the real new-slug editor did not open');
             input(document.getElementById('edit-body'), 'unsaved body for the real new slug');
             document.getElementById('new-button').click();
-            await until(() => document.getElementById('piplet-composer'), 'the distinct null-ID composer did not open');
-            const realNewDraftKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:new'));
-            assert(realNewDraftKey && JSON.parse(sessionStorage.getItem(realNewDraftKey))?.id === 'new'
-                && JSON.parse(sessionStorage.getItem(realNewDraftKey))?.body === 'unsaved body for the real new slug',
-                'the real new-slug recovery draft was lost or mistaken for a composer');
+            await until(() => document.getElementById('piplet-composer'), 'a separate composer did not open');
+            const savedNoteDraft = storedDrafts().find(item => item.draft.body === 'unsaved body for the real new slug');
+            assert(savedNoteDraft && savedNoteDraft.draft.id === 'new'
+                && /:draft:v2:[a-f0-9]{32}$/.test(savedNoteDraft.key),
+                'the saved-note recovery was not an independent random record');
             input(document.getElementById('edit-title'), 'Separate composer');
             input(document.getElementById('edit-body'), 'separate null-ID draft');
-            const composerDraftKey = realNewDraftKey.replace(/draft:new$/, 'draft:@new');
-            await until(() => {
-                try { return JSON.parse(sessionStorage.getItem(composerDraftKey))?.body === 'separate null-ID draft'; }
-                catch (_) { return false; }
-            }, 'the null-ID composer did not use its separate recovery key');
-            assert(JSON.parse(sessionStorage.getItem(realNewDraftKey))?.body === 'unsaved body for the real new slug'
-                && document.querySelectorAll('#piplet-note-new, #piplet-composer').length === 2,
-                'the composer overwrote the real new-slug draft or duplicated its DOM ID');
+            await until(() => storedDrafts().some(item => item.draft.body === 'separate null-ID draft'),
+                'the composer recovery was not stored');
+            const composerDraft = storedDrafts().find(item => item.draft.body === 'separate null-ID draft');
+            assert(composerDraft.draft.id === null && composerDraft.key !== savedNoteDraft.key,
+                'two editors shared or overwrote a recovery record');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'the separate composer did not cancel');
+            assert(sessionStorage.getItem(composerDraft.key) === null
+                && JSON.parse(sessionStorage.getItem(savedNoteDraft.key))?.body === 'unsaved body for the real new slug',
+                'cancel removed the wrong immutable recovery record');
             click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'reopen the real new-slug note');
-            await until(() => document.querySelector('#piplet-note-new.editor'), 'the real new-slug recovery did not reopen');
-            assert(document.getElementById('edit-body').value === 'unsaved body for the real new slug', 'the real new-slug draft did not round-trip');
+            await until(() => document.querySelector('#piplet-note-new.editor'), 'the saved-note recovery did not reopen');
+            assert(document.getElementById('edit-body').value === 'unsaved body for the real new slug',
+                'the saved-note recovery did not round-trip');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'the real new-slug recovery did not discard');
-
-            sessionStorage.setItem(realNewDraftKey, JSON.stringify({
-                id: null, baseRevision: 0, createToken: 'abababababababababababababababab',
-                title: 'Legacy composer', body: 'legacy null-ID body', tags: []
-            }));
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while a legacy null-ID draft owns draft:new');
-            await until(() => document.getElementById('piplet-composer'), 'editor entry did not prioritize the legacy null-ID draft');
-            assert(document.getElementById('edit-title').value === 'Legacy composer'
-                && document.getElementById('edit-body').value === 'legacy null-ID body',
-                'the old draft:new composer format was not read compatibly');
-            input(document.getElementById('edit-body'), 'migrated null-ID body');
-            await until(() => {
-                try { return JSON.parse(sessionStorage.getItem(composerDraftKey))?.body === 'migrated null-ID body'; }
-                catch (_) { return false; }
-            }, 'the legacy composer was not migrated to draft:@new');
-            assert(sessionStorage.getItem(realNewDraftKey) === null, 'legacy draft:new remained after migration');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'the migrated composer did not cancel');
-
-            sessionStorage.setItem(composerDraftKey, JSON.stringify({
-                id: null, baseRevision: 0, createToken: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
-                title: 'Canonical composer', body: 'keep this first', tags: []
-            }));
-            sessionStorage.setItem(realNewDraftKey, JSON.stringify({
-                id: null, baseRevision: 0, createToken: 'efefefefefefefefefefefefefefefef',
-                title: 'Independent legacy composer', body: 'keep this second', tags: []
-            }));
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while two composer recoveries coexist');
-            await until(() => document.getElementById('piplet-composer'), 'coexisting composer recovery did not open');
-            assert(document.getElementById('edit-title').value === 'Canonical composer', 'legacy migration overwrote the independent canonical composer');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'canonical composer recovery did not resolve');
-            assert(sessionStorage.getItem(realNewDraftKey) !== null, 'resolving the canonical composer deleted its independent legacy peer');
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit after resolving the canonical composer');
-            await until(() => document.getElementById('piplet-composer'), 'the second composer recovery did not open');
-            assert(document.getElementById('edit-title').value === 'Independent legacy composer', 'the independent legacy composer did not drain second');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'the independent legacy composer did not resolve');
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit the real new slug after draining composer recoveries');
-            await until(() => document.querySelector('#piplet-note-new.editor'), 'composer recovery keys still blocked the real new-slug note');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'the real new-slug editor did not close after recovery drainage');
-
-            sessionStorage.setItem(composerDraftKey, JSON.stringify({
-                id: null, baseRevision: 0, createToken: '12121212121212121212121212121212',
-                title: 'Cycle owner', body: 'recover this cycle head', tags: [], previousDraftKeys: [realNewDraftKey]
-            }));
-            sessionStorage.setItem(realNewDraftKey, JSON.stringify({
-                id: 'new', baseRevision: 1, title: 'Cycle predecessor', body: 'older cycle text', tags: [],
-                previousDraftKeys: [composerDraftKey]
-            }));
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while recovery metadata contains a cycle');
-            await until(() => document.getElementById('piplet-composer'), 'cyclic recovery metadata hid every writable draft');
-            assert(document.getElementById('edit-title').value === 'Cycle owner', 'cycle recovery did not prefer the canonical composer');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'cyclic recovery did not resolve');
-            assert(!sessionStorage.getItem(composerDraftKey) && !sessionStorage.getItem(realNewDraftKey), 'cyclic recovery cleanup left a hidden component');
-
-            const cycleAKey = composerDraftKey.replace(/@new$/, 'missing-cycle-a');
-            const cycleBKey = composerDraftKey.replace(/@new$/, 'missing-cycle-b');
-            sessionStorage.setItem(composerDraftKey, JSON.stringify({
-                id: null, baseRevision: 0, createToken: '34343434343434343434343434343434',
-                title: 'Independent before orphan cycle', body: 'do not overwrite this composer', tags: []
-            }));
-            sessionStorage.setItem(cycleAKey, JSON.stringify({
-                id: 'missing-cycle-a', baseRevision: 2, title: 'Disjoint cycle owner', body: 'newer cyclic recovery', tags: [],
-                previousDraftKeys: [cycleBKey]
-            }));
-            sessionStorage.setItem(cycleBKey, JSON.stringify({
-                id: 'missing-cycle-b', baseRevision: 1, title: 'Disjoint cycle predecessor', body: 'older cyclic recovery', tags: [],
-                previousDraftKeys: [cycleAKey]
-            }));
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit while an orphan cycle competes with a composer');
-            await until(() => document.getElementById('piplet-composer'), 'the independent composer did not open ahead of the orphan cycle');
-            assert(document.getElementById('edit-title').value === 'Independent before orphan cycle'
-                && JSON.parse(sessionStorage.getItem(cycleAKey))?.body === 'newer cyclic recovery',
-                'an orphan recovery cycle overwrote the independent composer destination');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'the independent cycle-blocking composer did not resolve');
-            click(document.querySelector('#piplet-note-new button[title="Edit note"]'), 'edit after resolving the independent cycle-blocking composer');
-            await until(() => document.querySelector('.conflict-panel')?.textContent.includes('deleted elsewhere'),
-                'the disjoint orphan cycle did not drain after its destination resolved');
-            assert(['Disjoint cycle owner', 'Disjoint cycle predecessor'].includes(document.getElementById('edit-title').value),
-                'the disjoint cycle recovery lost its recoverable component');
-            button(document.querySelector('.conflict-panel'), 'Discard draft').click();
-            await until(() => !document.querySelector('.editor'), 'the disjoint cycle recovery did not discard');
-            assert(!sessionStorage.getItem(cycleAKey) && !sessionStorage.getItem(cycleBKey),
-                'discarding the disjoint recovery cycle left a hidden component');
+            await until(() => !document.querySelector('.editor'), 'the saved-note recovery did not discard');
 
             document.getElementById('new-button').click();
             await until(() => document.getElementById('piplet-composer'), 'the fixed-ID collision composer did not open');
@@ -1786,6 +2678,7 @@ PHP;
             deleteStatusExpiry();
             assert(document.getElementById('global-status').textContent === '', 'the expired delete notice left stale header context');
 
+
             let loseCreateResponse = true;
             window.fetch = (resource, options) => {
                 if (loseCreateResponse && String(resource).includes('api=save')) {
@@ -1799,118 +2692,61 @@ PHP;
             input(document.getElementById('edit-title'), 'Lost response create');
             input(document.getElementById('edit-body'), 'committed body');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.querySelector('.save-status')?.textContent.includes('Could not reach'), 'lost create response was not reported');
+            await until(() => document.querySelector('.save-status')?.textContent.includes('Could not reach'),
+                'lost create response was not reported');
+            const originalRecovery = storedDrafts().find(item => item.draft.title === 'Lost response create');
+            assert(originalRecovery && /^[a-f0-9]{32}$/.test(originalRecovery.draft.createToken),
+                'lost create was not recoverable with a stable token');
             input(document.getElementById('edit-body'), 'changed after lost response');
             window.fetch = nativeFetch;
-            const lostSnapshot = await nativeFetch('?download=1').then(response => response.text());
-            const lostMarker = '\nPIPLET-DATA/1\n';
-            const lostDocument = JSON.parse(lostSnapshot.slice(lostSnapshot.lastIndexOf(lostMarker) + lostMarker.length).trim());
-            const lostCurrent = Object.values(lostDocument.notes).find(note => note.title === 'Lost response create');
-            const oldCreateKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:@new'));
-            assert(lostCurrent && oldCreateKey, 'the lost-create collision fixture was incomplete');
-            const occupiedCreateKey = `${oldCreateKey.slice(0, -4)}${lostCurrent.id}`;
-            sessionStorage.setItem(occupiedCreateKey, JSON.stringify({
-                id: lostCurrent.id, baseRevision: lostCurrent.revision,
-                title: 'Independent destination draft', body: 'do not overwrite this draft', tags: ['independent']
-            }));
-            const occupiedCreateSetItem = Storage.prototype.setItem;
-            Storage.prototype.setItem = function (key, value) {
-                if (key === oldCreateKey) throw new DOMException('blocked', 'QuotaExceededError');
-                return occupiedCreateSetItem.call(this, key, value);
-            };
-            input(document.getElementById('edit-body'), 'latest text while recovery storage fails');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.querySelector('.save-status')?.textContent.includes('other recovery was not opened'),
-                'create-conflict switch did not report its failed source recovery');
-            assert(document.getElementById('edit-body')?.value === 'latest text while recovery storage fails',
-                'create-conflict switch hid live text after source recovery failed');
-            Storage.prototype.setItem = occupiedCreateSetItem;
+            await until(() => document.querySelector('.conflict-panel'),
+                'changed lost-response retry did not show its conflict');
+            assert(document.getElementById('edit-body').value === 'changed after lost response'
+                && storedDrafts().some(item => item.draft.body === 'changed after lost response'),
+                'create conflict lost its live or persisted draft');
+            await until(() => document.querySelector('.conflict-panel')?.contains(document.activeElement),
+                'create conflict did not receive keyboard focus');
+            button(document.querySelector('.conflict-panel'), 'Replace saved version').click();
+            await until(() => !document.querySelector('.conflict-panel'), 'the lost create did not rebase onto its saved note');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.getElementById('edit-title')?.value === 'Independent destination draft',
-                'create-conflict migration did not open its occupied destination first');
-            assert(JSON.parse(sessionStorage.getItem(oldCreateKey))?.body === 'latest text while recovery storage fails',
-                'create-conflict migration overwrote the source composer');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'occupied create destination did not resolve');
-            document.getElementById('new-button').click();
-            await until(() => document.getElementById('edit-body')?.value === 'latest text while recovery storage fails',
-                'the preserved lost-response composer did not reopen');
-            const createConflictSetItem = Storage.prototype.setItem;
-            Storage.prototype.setItem = function (key, value) {
-                if (String(key).includes('draft:')) throw new DOMException('blocked', 'QuotaExceededError');
-                return createConflictSetItem.call(this, key, value);
-            };
-            document.querySelector('.editor form').requestSubmit();
-            await until(() => document.querySelector('.conflict-panel'), 'changed lost-response retry did not show its conflict');
-            assert(document.querySelector('.editor') && document.getElementById('edit-body').value === 'latest text while recovery storage fails', 'create conflict disappeared or lost its draft');
-            assert(document.querySelector('.save-status').textContent.includes('could not store'), 'create conflict storage failure was mislabeled as recovered');
-            await until(() => document.querySelector('.conflict-panel')?.contains(document.activeElement), 'create conflict did not receive keyboard focus');
-            Storage.prototype.setItem = createConflictSetItem;
+            await until(() => !document.querySelector('.editor'), 'replacing the committed create did not save');
+            const replacedLost = await downloadDocument();
+            assert(Object.values(replacedLost.notes).some(note => note.title === 'Lost response create'
+                && note.body === 'changed after lost response'),
+                'the rebased lost create retained a create-only token or lost its changed body');
+            assert(sessionStorage.getItem(originalRecovery.key) === null,
+                'resolving the lost create left its immutable recovery record behind');
 
-            assert(oldCreateKey, 'the failed create migration lost its original recovery key');
-            const createConflictRemoveItem = Storage.prototype.removeItem;
-            Storage.prototype.removeItem = function (key) {
-                if (key === oldCreateKey) throw new DOMException('blocked', 'SecurityError');
-                return createConflictRemoveItem.call(this, key);
-            };
-            Storage.prototype.setItem = function (key, value) {
-                if (key === oldCreateKey && value === 'null') throw new DOMException('blocked', 'SecurityError');
-                return createConflictSetItem.call(this, key, value);
-            };
-            let migrationRetryCalls = 0;
+            document.getElementById('new-button').click();
+            await until(() => document.querySelector('.editor'), 'lineage-conflict editor did not open');
+            input(document.getElementById('edit-title'), 'Recovered across rekey');
+            input(document.getElementById('edit-body'), 'keep this unsent draft');
+            const lineageDocument = await downloadDocument();
+            let injectLineageConflict = true;
             window.fetch = (resource, options) => {
-                if (String(resource).includes('api=save')) migrationRetryCalls++;
+                if (injectLineageConflict && String(resource).includes('api=save')) {
+                    injectLineageConflict = false;
+                    return Promise.resolve(new Response(JSON.stringify({
+                        ok: false, error: 'This piplet changed lineage; reload before saving.',
+                        current: null, generation: lineageDocument.generation
+                    }), {status: 409, headers: {'Content-Type': 'application/json'}}));
+                }
                 return nativeFetch(resource, options);
             };
             document.querySelector('.editor form').requestSubmit();
-            await until(() => migrationRetryCalls === 1
-                && !document.querySelector('.editor button[type="submit"]').disabled
-                && document.querySelector('.save-status').textContent.includes('older recovery copy'),
-                'selective conflict cleanup failure was not reported');
-            const authoritativeCreateKey = Object.keys(sessionStorage).find(key => {
-                if (key === oldCreateKey) return false;
-                try { return JSON.parse(sessionStorage.getItem(key))?.title === 'Lost response create'; }
-                catch (_) { return false; }
-            });
-            const authoritativeCreate = JSON.parse(sessionStorage.getItem(authoritativeCreateKey));
-            assert(authoritativeCreate?.previousDraftKeys?.includes(oldCreateKey), 'conflict migration did not link its authoritative recovery before cleanup');
-            Storage.prototype.removeItem = createConflictRemoveItem;
-            Storage.prototype.setItem = createConflictSetItem;
+            await until(() => document.querySelector('.conflict-panel'), 'a stale composer did not show a lineage conflict');
+            assert(document.getElementById('edit-body').value === 'keep this unsent draft',
+                'the lineage conflict lost its unsent draft');
+            button(document.querySelector('.conflict-panel'), 'Save as new in this piplet').click();
+            await until(() => !document.querySelector('.conflict-panel'), 'the lineage adoption action did not rebase the draft');
             window.fetch = nativeFetch;
-            const blockedLatestSetItem = Storage.prototype.setItem;
-            Storage.prototype.setItem = function (key, value) {
-                if (String(key).includes('draft:')) throw new DOMException('blocked', 'QuotaExceededError');
-                return blockedLatestSetItem.call(this, key, value);
-            };
-            input(document.getElementById('edit-body'), 'changed while latest recovery writes fail');
-            await until(() => document.querySelector('.save-status').textContent.includes('could not store the latest draft'),
-                'a latest-write failure kept the stale safe-recovery message');
-            assert(JSON.parse(sessionStorage.getItem(authoritativeCreateKey)).body !== 'changed while latest recovery writes fail',
-                'the latest-write failure test did not leave storage behind the live editor');
-            Storage.prototype.setItem = blockedLatestSetItem;
-            window.dispatchEvent(new Event('pagehide'));
-            assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:@new')), 'an immediate flush after storage recovery did not clean the old draft key');
-            input(document.getElementById('edit-body'), 'changed after storage recovered');
-            await until(() => {
-                try {
-                    return JSON.parse(sessionStorage.getItem(authoritativeCreateKey))?.body === 'changed after storage recovered'
-                        && document.querySelector('.save-status').textContent === 'Changes stay in this browser until you save.';
-                } catch (_) { return false; }
-            }, 'successful browser recovery did not clear the prior latest-write warning');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => {
-                const panel = document.querySelector('.conflict-panel');
-                return panel && !panel.querySelector('button').disabled
-                    && !document.querySelector('.save-status').textContent.includes('could not store');
-            }, 'create conflict recovery did not retry');
-            assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:@new')), 'successful conflict migration left the original new-note draft behind');
-            button(document.querySelector('.conflict-panel'), 'Use saved version').click();
-            await until(() => !document.querySelector('.editor'), 'using the committed create did not close its draft');
-            document.getElementById('new-button').click();
-            await until(() => document.querySelector('.editor'), 'fresh editor did not open after conflict cleanup');
-            assert(document.getElementById('edit-title').value === '' && document.getElementById('edit-body').value === '', 'stale create conflict text resurfaced in a new draft');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'fresh editor did not cancel');
+            await until(() => !document.querySelector('.editor'), 'the explicitly rebased lineage draft did not save');
+            const lineageSaved = await downloadDocument();
+            assert(Object.values(lineageSaved.notes).some(note => note.title === 'Recovered across rekey'
+                && note.body === 'keep this unsent draft'),
+                'the explicitly rebased lineage draft did not round-trip');
 
             const welcomeForConflict = await findLibraryItem('Hello, piplet');
             assert(welcomeForConflict, 'welcome was missing from the conflict library');
@@ -1944,10 +2780,10 @@ PHP;
             click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'pristine welcome edit');
             await until(() => document.querySelector('#piplet-note-welcome.editor'), 'pristine editor did not open');
             window.dispatchEvent(new Event('pagehide'));
-            assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:welcome')), 'pagehide created a recovery draft for an untouched editor');
+            assert(!storedDrafts().some(item => item.draft.id === 'welcome'), 'pagehide created a recovery draft for an untouched editor');
             document.getElementById('new-button').click();
             await until(() => document.getElementById('piplet-composer'), 'switching away from an untouched editor failed');
-            assert(!Object.keys(sessionStorage).some(key => key.endsWith('draft:welcome')), 'switching notes created a false recovery draft');
+            assert(!storedDrafts().some(item => item.draft.id === 'welcome'), 'switching notes created a false recovery draft');
             button(document.querySelector('.editor-actions'), 'Cancel').click();
             await until(() => !document.querySelector('.editor'), 'untouched new editor did not cancel');
 
@@ -1960,6 +2796,24 @@ PHP;
             click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'ordinary cancel welcome reopen');
             await until(() => document.querySelector('#piplet-note-welcome.editor'), 'ordinary-cancel note did not reopen');
             assert(document.getElementById('edit-body').value === 'saved in another tab', 'ordinary cancel retained discarded text');
+            input(document.getElementById('edit-body'), 'draft whose getItem fails');
+            await until(() => storedDrafts().some(item => item.draft.body === 'draft whose getItem fails'),
+                'getItem-failure draft was not stored first');
+            const originalGetItem = Storage.prototype.getItem;
+            Storage.prototype.getItem = function (key) {
+                if (String(key).includes('draft:')) throw new DOMException('blocked', 'SecurityError');
+                return originalGetItem.call(this, key);
+            };
+            button(document.querySelector('.editor-actions'), 'Cancel').click();
+            assert(document.querySelector('#piplet-note-welcome.editor')
+                && document.querySelector('.save-status').textContent.includes('could not discard'),
+                'a browser-storage read failure was mistaken for successful draft removal');
+            Storage.prototype.getItem = originalGetItem;
+            button(document.querySelector('.editor-actions'), 'Cancel').click();
+            await until(() => !document.querySelector('.editor'), 'getItem-failure editor did not close after storage recovered');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'), 'getItem welcome reopen');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'), 'getItem-failure note did not reopen cleanly');
+            assert(document.getElementById('edit-body').value === 'saved in another tab', 'getItem failure resurrected discarded text');
             input(document.getElementById('edit-body'), 'draft whose removeItem fails');
             const originalRemoveItem = Storage.prototype.removeItem;
             Storage.prototype.removeItem = function (key) {
@@ -1983,14 +2837,30 @@ PHP;
                 return originalSetItem.call(this, key, value);
             };
             input(document.getElementById('edit-body'), 'must stay visible');
+            const blockedUnload = new Event('beforeunload', {cancelable: true});
+            window.dispatchEvent(blockedUnload);
+            assert(blockedUnload.defaultPrevented,
+                'beforeunload did not protect a dirty draft when recovery storage failed');
             document.getElementById('new-button').click();
             assert(document.getElementById('edit-body')?.value === 'must stay visible', 'storage failure allowed an editor switch');
             assert(document.querySelector('.save-status').dataset.kind === 'error', 'storage failure was not reported');
+            const staleTokenFetch = window.fetch;
+            window.fetch = (resource, options) => String(resource).includes('api=save')
+                ? Promise.resolve(new Response(JSON.stringify({ok: false, error: 'Refresh the page before saving again.'}), {
+                    status: 403, headers: {'Content-Type': 'application/json'}
+                }))
+                : staleTokenFetch(resource, options);
+            document.querySelector('.editor form').requestSubmit();
+            await until(() => document.querySelector('.save-status')?.textContent.includes('not in recovery storage'),
+                'a stale security token advised refresh after browser recovery had failed');
+            assert(document.getElementById('edit-body')?.value === 'must stay visible',
+                'a stale security token hid the only live copy of an unstored draft');
+            window.fetch = staleTokenFetch;
             Storage.prototype.setItem = originalSetItem;
 
             input(document.getElementById('edit-body'), 'flushed on pagehide');
             window.dispatchEvent(new Event('pagehide'));
-            const draftStorageKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:welcome'));
+            const draftStorageKey = storedDrafts().find(item => item.draft.body === 'flushed on pagehide')?.key;
             assert(draftStorageKey && JSON.parse(sessionStorage.getItem(draftStorageKey)).body === 'flushed on pagehide', 'pagehide did not synchronously flush the draft');
 
             input(document.getElementById('edit-body'), 'x'.repeat(513 * 1024));
@@ -2012,66 +2882,106 @@ PHP;
             assert(welcome.querySelector('.plain-note').value === structured, 'bounded renderer did not retain complete text');
             assert(welcome.querySelectorAll('*').length < 250, 'bounded renderer created too many DOM nodes');
 
-            document.getElementById('new-button').click();
-            await until(() => document.getElementById('piplet-composer'), 'the remote-delete collision composer did not open');
-            input(document.getElementById('edit-title'), 'Independent composer before delete');
-            input(document.getElementById('edit-body'), 'keep this independent composer');
+
             const deletedConflictItem = await findLibraryItem('One browser save');
             deletedConflictItem.click();
-            await until(() => [...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save'), 'deleted-conflict note did not open');
-            const deletedConflictArticle = [...document.querySelectorAll('.note')].find(node => node.querySelector('.note-title')?.textContent === 'One browser save');
+            await until(() => [...document.querySelectorAll('.note-title')].some(node => node.textContent === 'One browser save'),
+                'deleted-conflict note did not open');
+            const deletedConflictArticle = [...document.querySelectorAll('.note')]
+                .find(node => node.querySelector('.note-title')?.textContent === 'One browser save');
             click(deletedConflictArticle?.querySelector('button[title="Edit note"]'), 'deleted-conflict edit');
             input(document.getElementById('edit-body'), 'keep after remote deletion');
-            const independentComposerKey = Object.keys(sessionStorage).find(key => key.endsWith('draft:@new'));
-            assert(independentComposerKey && JSON.parse(sessionStorage.getItem(independentComposerKey))?.body === 'keep this independent composer',
-                'switching to the delete-conflict note did not preserve its independent composer');
+            window.dispatchEvent(new Event('pagehide'));
+            const deletedRecovery = storedDrafts().find(item => item.draft.body === 'keep after remote deletion');
+            assert(deletedRecovery, 'deleted-note draft did not persist before its conflict');
             const conflictSnapshot = await nativeFetch('?download=1').then(response => response.text());
-            const conflictMarker = '\nPIPLET-DATA/1\n';
-            const conflictAt = conflictSnapshot.lastIndexOf(conflictMarker);
-            assert(conflictAt >= 0, 'deleted-conflict snapshot marker was missing');
-            const conflictDocument = JSON.parse(conflictSnapshot.slice(conflictAt + conflictMarker.length).trim());
+            const conflictMarker = '\nPIPLET-DATA/2\n';
+            const conflictDocument = JSON.parse(conflictSnapshot.slice(conflictSnapshot.lastIndexOf(conflictMarker) + conflictMarker.length).trim());
             const deletedConflictNote = Object.values(conflictDocument.notes).find(note => note.title === 'One browser save');
-            assert(deletedConflictNote, 'deleted-conflict snapshot note was missing');
-            assert((await api('delete', {id: deletedConflictNote.id, baseRevision: deletedConflictNote.revision})).ok, 'deleted-conflict remote delete failed');
+            assert((await api('delete', {id: deletedConflictNote.id, baseRevision: deletedConflictNote.revision})).ok,
+                'deleted-conflict remote delete failed');
             document.querySelector('.editor form').requestSubmit();
-            await until(() => document.querySelector('.conflict-panel')?.textContent.includes('deleted elsewhere'), 'deleted-note save did not show its conflict');
-            const deletedOpenKey = Object.keys(sessionStorage).find(key => key.endsWith(':open'));
-            assert(!JSON.parse(sessionStorage.getItem(deletedOpenKey) || '[]').includes(deletedConflictNote.id), 'deleted-note conflict left a dead ID in the open-note state');
-            assert(location.hash !== `#${encodeURIComponent(deletedConflictNote.id)}`, 'deleted-note conflict left a dead URL hash');
-            assert(JSON.parse(sessionStorage.getItem(independentComposerKey))?.body === 'keep this independent composer',
-                'deleted-note conflict overwrote the independent composer destination');
-            const deletedSourceKey = `${independentComposerKey.slice(0, -4)}${deletedConflictNote.id}`;
-            assert(JSON.parse(sessionStorage.getItem(deletedSourceKey))?.body === 'keep after remote deletion',
-                'deleted-note conflict did not remain recoverable at its source key');
-            const deletedConflictSetItem = Storage.prototype.setItem;
-            Storage.prototype.setItem = function (key, value) {
-                if (key === deletedSourceKey) throw new DOMException('blocked', 'QuotaExceededError');
-                return deletedConflictSetItem.call(this, key, value);
-            };
-            input(document.getElementById('edit-body'), 'latest deleted-note text while storage fails');
-            button(document.querySelector('.conflict-panel'), 'Save as new').click();
-            await until(() => document.querySelector('.save-status')?.textContent.includes('other recovery was not opened'),
-                'deleted-note switch did not report its failed source recovery');
-            assert(document.getElementById('edit-body')?.value === 'latest deleted-note text while storage fails',
-                'deleted-note switch hid live text after source recovery failed');
-            Storage.prototype.setItem = deletedConflictSetItem;
-            button(document.querySelector('.conflict-panel'), 'Save as new').click();
-            await until(() => document.getElementById('edit-body')?.value === 'keep this independent composer',
-                'deleted-note conversion did not open the occupied composer first');
-            assert(JSON.parse(sessionStorage.getItem(deletedSourceKey))?.body === 'latest deleted-note text while storage fails',
-                'opening the occupied composer erased the deleted-note draft');
-            button(document.querySelector('.editor-actions'), 'Cancel').click();
-            await until(() => !document.querySelector('.editor'), 'independent composer did not resolve before deleted-note recovery');
-            document.getElementById('new-button').click();
             await until(() => document.querySelector('.conflict-panel')?.textContent.includes('deleted elsewhere'),
-                'deleted-note source draft did not reopen after the composer resolved');
-            assert(document.getElementById('edit-body').value === 'latest deleted-note text while storage fails', 'deleted-note source draft lost its text');
+                'deleted-note save did not show its conflict');
+            assert(document.getElementById('edit-body').value === 'keep after remote deletion'
+                && JSON.parse(sessionStorage.getItem(deletedRecovery.key))?.body === 'keep after remote deletion',
+                'deleted-note conflict lost its immutable recovery');
+            const deletedOpenKey = Object.keys(sessionStorage).find(key => key.endsWith(':open'));
+            assert(!JSON.parse(sessionStorage.getItem(deletedOpenKey) || '[]').includes(deletedConflictNote.id)
+                && location.hash !== `#${encodeURIComponent(deletedConflictNote.id)}`,
+                'deleted-note conflict retained dead navigation state');
             button(document.querySelector('.conflict-panel'), 'Discard draft').click();
             await until(() => !document.querySelector('.editor'), 'deleted-note conflict did not discard');
+            assert(sessionStorage.getItem(deletedRecovery.key) === null,
+                'discarding a deleted-note conflict left its recovery record behind');
 
-            assert(runtimeErrors.length === 0, `page error before story-cap reload: ${runtimeErrors.join('; ')}`);
-            sessionStorage.setItem('piplet-browser-phase', 'story-cap');
-            await progress('main:reload-story-cap');
+            const pristineItem = await findLibraryItem('Hello, piplet');
+            pristineItem.click();
+            await until(() => document.getElementById('piplet-note-welcome'),
+                'welcome did not open for the pristine conflict test');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'),
+                'open pristine editor before a competing save');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'),
+                'pristine conflict editor did not open');
+            const pristineBody = document.getElementById('edit-body').value;
+            const pristineSnapshot = await downloadDocument();
+            const pristineCurrent = pristineSnapshot.notes.welcome;
+            assert((await api('save', {
+                id: 'welcome', baseRevision: pristineCurrent.revision, title: pristineCurrent.title,
+                body: 'saved remotely after pristine editor opened', tags: pristineCurrent.tags
+            })).ok, 'the pristine competing save failed');
+            document.querySelector('.editor form').requestSubmit();
+            await until(() => document.querySelector('.conflict-panel'),
+                'an untouched stale editor did not show a conflict');
+            const pristineRecovery = storedDrafts().find(item => item.draft.id === 'welcome'
+                && item.draft.body === pristineBody);
+            assert(pristineRecovery, 'an untouched stale editor was not forced into browser recovery');
+            button(document.querySelector('.editor-actions'), 'Cancel').click();
+            await until(() => !document.querySelector('.editor'), 'the pristine conflict did not close while retaining recovery');
+            assert(sessionStorage.getItem(pristineRecovery.key) !== null,
+                'closing the pristine conflict lost its only old copy');
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'),
+                'reopen the pristine conflict recovery');
+            await until(() => document.querySelector('.conflict-panel'),
+                'the pristine conflict recovery did not reopen');
+            button(document.querySelector('.conflict-panel'), 'Use saved version').click();
+            await until(() => !document.querySelector('.editor'),
+                'the pristine conflict recovery did not resolve explicitly');
+
+            click(document.querySelector('#piplet-note-welcome button[title="Edit note"]'),
+                'open an existing note for restored-lineage conflict testing');
+            await until(() => document.querySelector('#piplet-note-welcome.editor'),
+                'restored-lineage editor did not open');
+            input(document.getElementById('edit-body'), 'draft from the earlier lineage');
+            const lineageSnapshot = await downloadDocument();
+            const restoredCurrent = lineageSnapshot.notes.welcome;
+            const fakeGeneration = lineageSnapshot.generation.startsWith('f')
+                ? `e${lineageSnapshot.generation.slice(1)}` : `f${lineageSnapshot.generation.slice(1)}`;
+            let injectExistingLineage = true;
+            window.fetch = (resource, options) => {
+                if (injectExistingLineage && String(resource).includes('api=save')) {
+                    injectExistingLineage = false;
+                    return Promise.resolve(new Response(JSON.stringify({
+                        ok: false, error: 'This piplet changed lineage; reload before saving.',
+                        current: restoredCurrent, generation: fakeGeneration
+                    }), {status: 409, headers: {'Content-Type': 'application/json'}}));
+                }
+                return nativeFetch(resource, options);
+            };
+            document.querySelector('.editor form').requestSubmit();
+            await until(() => document.querySelector('.conflict-panel')?.textContent.includes('earlier restored copy'),
+                'an existing-note generation mismatch was downgraded to an ordinary edit conflict');
+            assert(document.getElementById('edit-body').value === 'draft from the earlier lineage'
+                && [...document.querySelectorAll('.conflict-panel button')].some(item => item.textContent === 'Save as new in this piplet')
+                && ![...document.querySelectorAll('.conflict-panel button')].some(item => item.textContent === 'Replace saved version'),
+                'the restored-lineage conflict lost its draft or offered to overwrite restored content');
+            button(document.querySelector('.conflict-panel'), 'Discard draft').click();
+            await until(() => !document.querySelector('.editor'), 'the restored-lineage conflict did not discard');
+            window.fetch = nativeFetch;
+
+            assert(runtimeErrors.length === 0, `page error before writable recovery reload: ${runtimeErrors.join('; ')}`);
+            sessionStorage.setItem('piplet-browser-phase', 'writable-setup');
+            await progress('main:reload-writable-setup');
             location.reload();
             await new Promise(() => {});
         };
@@ -2092,51 +3002,125 @@ PHP;
     $httpSource = file_get_contents($httpCopy);
     check(is_string($httpSource) && substr_count($httpSource, $browserNeedle) === 1, 'Could not locate the browser harness insertion point.');
     $testPrelude = <<<'PHP'
-if (($_GET['__browser_readonly'] ?? null) === '1') {
-    if (!chmod(__DIR__, 0555)) { http_response_code(500); }
-    exit;
-}
-if (isset($_GET['__browser_progress'])) {
-    file_put_contents(__DIR__ . '/browser-progress.log', (string) $_GET['__browser_progress'] . "\n", FILE_APPEND);
-    exit;
+if (isset($_GET['__browser_readonly']) || isset($_GET['__browser_rekey']) || isset($_GET['__browser_progress'])) {
+    $testCapability = $_SERVER['HTTP_X_PIPLET_TEST_CAPABILITY'] ?? '';
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST'
+        || !is_string($testCapability)
+        || !hash_equals('__PIPLET_TEST_CAPABILITY__', $testCapability)) {
+        http_response_code(404);
+        exit("Not found.\n");
+    }
+    if (($_GET['__browser_rekey'] ?? null) === '1') {
+        define('PIPLET_TEST_REKEY', true);
+    } elseif (($_GET['__browser_readonly'] ?? null) === '1') {
+        if (!chmod(__DIR__, 0555)) { http_response_code(500); }
+        exit;
+    } else {
+        $progress = (string) ($_GET['__browser_progress'] ?? '');
+        if ($progress === '' || strlen($progress) > 1000 || strpbrk($progress, "\r\n") !== false) {
+            http_response_code(400);
+            exit;
+        }
+        file_put_contents(__DIR__ . '/browser-progress.log', $progress . "\n", FILE_APPEND | LOCK_EX);
+        exit;
+    }
 }
 PHP;
+    $browserHarness = str_replace('__PIPLET_TEST_CAPABILITY__', $browserCapability, $browserHarness);
+    $testPrelude = str_replace('__PIPLET_TEST_CAPABILITY__', $browserCapability, $testPrelude);
     $declareNeedle = "declare(strict_types=1);\n";
     check(substr_count($httpSource, $declareNeedle) === 1, 'Could not locate the browser fixture prelude point.');
     $httpSource = str_replace($declareNeedle, $declareNeedle . $testPrelude . "\n", $httpSource);
+    $dispatchNeedle = "if (!defined('PIPLET_LIBRARY_ONLY')) {\n";
+    $testTail = <<<'PHP'
+if (defined('PIPLET_TEST_REKEY')) {
+    piplet_mutate(function (array &$document): array {
+        piplet_rekey_document($document);
+        return [];
+    });
+    http_response_code(204);
+    exit;
+}
+PHP;
+    check(substr_count($httpSource, $dispatchNeedle) === 1, 'Could not locate the browser fixture dispatch point.');
+    $httpSource = str_replace($dispatchNeedle, $testTail . "\n" . $dispatchNeedle, $httpSource);
     check(file_put_contents($httpCopy, str_replace($browserNeedle, "    </script>\n$browserHarness</body>", $httpSource)) !== false, 'Could not instrument the browser fixture.');
     $browserSignal = $httpRoot . '/browser-progress.log';
     check(file_put_contents($browserSignal, '') === 0, 'Could not initialize the browser completion signal.');
+    $longPathSegment = str_repeat('p', 220);
+    $longPathRoot = $httpRoot . '/' . $longPathSegment;
+    $longPathCopy = $longPathRoot . '/index.php';
+    $longPathSignal = $longPathRoot . '/browser-progress.log';
+    check(mkdir($longPathRoot, 0700) && copy($httpCopy, $longPathCopy)
+        && file_put_contents($longPathSignal, '') === 0,
+        'Could not create the long-path browser fixture.');
     [$server, $port] = start_test_server(
         $httpRoot,
-        test_environment(['PIPLET_ALLOW_PASSWORDLESS' => '1']),
+        test_environment(['PIPLET_PASSWORD' => 'browser-test']),
         'Could not start the PHP test server.'
     );
+    $defaultHttpHeaders = ['Authorization: Basic ' . base64_encode('writer:browser-test')];
+    $browserBase = "http://writer:browser-test@127.0.0.1:$port";
     try {
+        [$anonymousProgress] = http_request("http://127.0.0.1:$port/?__browser_progress=state%3Aresult%3APASS");
+        [$anonymousReadOnly] = http_request("http://127.0.0.1:$port/?__browser_readonly=1");
+        [$anonymousRekey] = http_request("http://127.0.0.1:$port/?__browser_rekey=1");
+        [$malformedProgress] = http_request(
+            "http://127.0.0.1:$port/?__browser_progress=state%3Aresult%3APASS%0Aforged",
+            'POST', ["X-Piplet-Test-Capability: $browserCapability"]
+        );
+        clearstatcache(true, $httpRoot);
+        check($anonymousProgress === 404 && $anonymousReadOnly === 404 && $anonymousRekey === 404
+            && $malformedProgress === 400
+            && file_get_contents($browserSignal) === '' && (fileperms($httpRoot) & 0777) === 0700,
+            'Unauthenticated or malformed browser-test hooks forged progress or changed fixture permissions.');
         [$getStatus, $getHeaders, $page] = http_request("http://127.0.0.1:$port/");
         check($getStatus === 200, 'The app page did not return 200.');
         check(!str_contains($page, '>one file<') && !str_contains($page, '> · </span>') && !str_contains($page, 'id="file-size"'),
             'The header retained its old one-file status, separator, or file size.');
         $csp = (string) header_value($getHeaders, 'Content-Security-Policy');
         check(
-            str_contains($csp, "default-src 'none'")
-                && preg_match("/script-src 'nonce-[^']+'/", $csp) === 1
-                && preg_match("/style-src 'nonce-[^']+'/", $csp) === 1
-                && str_contains($csp, "connect-src 'self'")
-                && str_contains($csp, 'img-src data:')
-                && str_contains($csp, "base-uri 'none'")
-                && str_contains($csp, "form-action 'self'")
-                && str_contains($csp, "frame-ancestors 'none'")
-                && !str_contains($csp, "'unsafe-inline'"),
+            preg_match("~^default-src 'none'; style-src 'nonce-([A-Za-z0-9+/]{24})'; "
+                . "script-src 'nonce-\\1'; connect-src 'self'; img-src data:; base-uri 'none'; "
+                . "form-action 'self'; frame-ancestors 'none'$~D", $csp) === 1,
             'The restrictive CSP contract changed.'
         );
+        check(strtolower((string) header_value($getHeaders, 'Cache-Control')) === 'no-store'
+            && strtolower((string) header_value($getHeaders, 'X-Content-Type-Options')) === 'nosniff'
+            && strtolower((string) header_value($getHeaders, 'Referrer-Policy')) === 'no-referrer'
+            && strtoupper((string) header_value($getHeaders, 'X-Frame-Options')) === 'DENY',
+            'The authenticated page lost its no-cache, anti-sniffing, referrer, or framing policy.');
         check(preg_match('/name="piplet-csrf" content="([a-f0-9]{64})"/', $page, $tokenMatch) === 1, 'The CSRF token is missing.');
         $setCookie = header_value($getHeaders, 'Set-Cookie');
         check($setCookie !== null && preg_match('/^([^=]+)=([^;]+)/', $setCookie, $cookieMatch) === 1, 'The CSRF cookie is missing.');
+        check(preg_match('/(?:^|;)\s*HttpOnly(?:;|$)/i', $setCookie) === 1
+            && preg_match('/(?:^|;)\s*SameSite=Lax(?:;|$)/i', $setCookie) === 1
+            && preg_match('/(?:^|;)\s*path=\/(?:;|$)/i', $setCookie) === 1
+            && preg_match('/(?:^|;)\s*Secure(?:;|$)/i', $setCookie) !== 1,
+            'The local-HTTP CSRF cookie lost its path, HttpOnly, SameSite, or non-Secure policy.');
         $token = $tokenMatch[1];
         $cookie = $cookieMatch[1] . '=' . $cookieMatch[2];
         $authorizedJsonHeaders = ["Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"];
-        $payload = json_encode(['id' => null, 'baseRevision' => 0, 'createToken' => str_repeat('d', 32), 'title' => 'HTTP note', 'body' => "# Safe heading\n\n## Subheading\n\n### Detail\n\n<img src=x onerror=alert(1)>", 'tags' => ['web']], JSON_THROW_ON_ERROR);
+        [$forwardedStatus, $forwardedHeaders] = http_request(
+            "http://127.0.0.1:$port/",
+            'GET',
+            ['X-Forwarded-Proto: https', 'Forwarded: proto=https']
+        );
+        $forwardedCookie = (string) header_value($forwardedHeaders, 'Set-Cookie');
+        check($forwardedStatus === 200 && !preg_match('/(?:^|;)\s*Secure(?:;|$)/i', $forwardedCookie),
+            'Untrusted forwarding headers changed the CSRF cookie security policy.');
+        $httpDocument = worker_command($httpCopy, 'read');
+        $httpAppearance = worker_command($httpCopy, 'current-appearance');
+        $payload = json_encode([
+            'id' => null,
+            'baseGeneration' => $httpDocument['generation'],
+            'baseRevision' => 0,
+            'baseVersion' => null,
+            'createToken' => str_repeat('d', 32),
+            'title' => 'HTTP note',
+            'body' => "# Safe heading\n\n## Subheading\n\n### Detail\n\n<img src=x onerror=alert(1)>\n<!--<script>boom</script>\u{2028}nul:\0",
+            'tags' => ['web'],
+        ], JSON_THROW_ON_ERROR);
         $hostileCss = ":root { --story-width: 60rem; --radius: 10px; }\n.note-title { letter-spacing: 0; }\n</style><script id=\"css-pwn\">document.body.dataset.pwned=1</script>";
         $httpAppearanceValues = [
             'palette' => 'ocean',
@@ -2145,17 +3129,50 @@ PHP;
             'measure' => 'wide',
             'customCss' => $hostileCss,
         ];
-        $appearancePayload = json_encode(['baseRevision' => 0, 'appearance' => $httpAppearanceValues], JSON_THROW_ON_ERROR);
+        $appearancePayload = json_encode([
+            'baseGeneration' => $httpDocument['generation'],
+            'baseRevision' => $httpAppearance['revision'],
+            'baseVersion' => $httpAppearance['version'],
+            'appearance' => $httpAppearanceValues,
+        ], JSON_THROW_ON_ERROR);
 
         [$rebindStatus] = http_request("http://127.0.0.1:$port/", 'GET', ['Host: notes.attacker.example']);
-        check($rebindStatus === 403, 'Password-free local mode accepted an untrusted Host header.');
+        check($rebindStatus === 200, 'Authenticated access unexpectedly depended on a trusted Host header.');
+        [$crossSiteStatus] = http_request("http://127.0.0.1:$port/?download=1", 'GET', [
+            'Sec-Fetch-Site: cross-site', 'Sec-Fetch-Mode: no-cors', 'Sec-Fetch-Dest: empty',
+        ]);
+        [$sameSiteStatus] = http_request("http://127.0.0.1:$port/", 'GET', [
+            'Sec-Fetch-Site: same-site', 'Sec-Fetch-Mode: no-cors', 'Sec-Fetch-Dest: image',
+        ]);
+        [$externalNavigationStatus] = http_request("http://127.0.0.1:$port/", 'GET', [
+            'Sec-Fetch-Site: cross-site', 'Sec-Fetch-Mode: navigate', 'Sec-Fetch-Dest: document',
+        ]);
+        check($crossSiteStatus === 403 && $sameSiteStatus === 403 && $externalNavigationStatus === 200,
+            'Fetch Metadata did not reject browser subresources while allowing top-level navigation.');
+        $crossSiteMutationHash = hash_file('sha256', $httpCopy);
+        [$crossSiteMutationStatus] = http_request(
+            "http://127.0.0.1:$port/?api=save",
+            'POST',
+            [...$authorizedJsonHeaders, 'Sec-Fetch-Site: cross-site', 'Sec-Fetch-Mode: cors', 'Sec-Fetch-Dest: empty'],
+            $payload
+        );
+        check($crossSiteMutationStatus === 403 && hash_file('sha256', $httpCopy) === $crossSiteMutationHash,
+            'A cross-origin browser mutation reached authentication, CSRF, or mutation work.');
         $rebindHash = hash_file('sha256', $httpCopy);
-        [$rebindMutationStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ['Host: notes.attacker.example', "Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $payload);
-        check($rebindMutationStatus === 403 && hash_file('sha256', $httpCopy) === $rebindHash, 'An untrusted Host reached a mutation endpoint.');
+        [$rebindMutationStatus] = http_request("http://127.0.0.1:$port/?api=unknown", 'POST', ['Host: notes.attacker.example', "Cookie: $cookie", 'Content-Type: application/json', "X-CSRF-Token: $token"], $payload);
+        check($rebindMutationStatus === 404 && hash_file('sha256', $httpCopy) === $rebindHash, 'Unknown authenticated action with an alternate Host reached mutation logic.');
         [$methodStatus, $methodHeaders] = http_request("http://127.0.0.1:$port/?api=save");
         check($methodStatus === 405 && header_value($methodHeaders, 'Allow') === 'POST', 'The API did not reject GET with Allow: POST.');
         [$appearanceMethodStatus, $appearanceMethodHeaders] = http_request("http://127.0.0.1:$port/?api=appearance");
         check($appearanceMethodStatus === 405 && header_value($appearanceMethodHeaders, 'Allow') === 'POST', 'The appearance API did not reject GET with Allow: POST.');
+        [$pagePostStatus, $pagePostHeaders] = http_request("http://127.0.0.1:$port/", 'POST');
+        check($pagePostStatus === 405 && header_value($pagePostHeaders, 'Allow') === 'GET, HEAD',
+            'The page route accepted a non-reading method.');
+        [$downloadPostStatus, $downloadPostHeaders] = http_request("http://127.0.0.1:$port/?download=1", 'POST');
+        check($downloadPostStatus === 405 && header_value($downloadPostHeaders, 'Allow') === 'GET, HEAD',
+            'The download route accepted a non-reading method.');
+        [$ambiguousStatus] = http_request("http://127.0.0.1:$port/?api=save&download=1");
+        check($ambiguousStatus === 400, 'An ambiguous API/download route was accepted.');
 
         [$missingStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', ['Content-Type: application/json'], $payload);
         check($missingStatus === 403, 'A mutation without CSRF protection was accepted.');
@@ -2166,20 +3183,152 @@ PHP;
         check($typeStatus === 415, 'The API accepted a non-JSON content type.');
         [$malformedStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, '{');
         check($malformedStatus === 400, 'The API accepted malformed JSON.');
+        foreach (['"Bad' . "\xC0\xAF" . '"', '"\\ud800"'] as $invalidRequestTitle) {
+            $invalidRequestPayload = str_replace('"HTTP note"', $invalidRequestTitle, $payload, $invalidRequestReplacements);
+            $invalidRequestHash = hash_file('sha256', $httpCopy);
+            [$invalidRequestStatus] = http_request(
+                "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $invalidRequestPayload
+            );
+            check($invalidRequestReplacements === 1 && $invalidRequestStatus === 400
+                && hash_file('sha256', $httpCopy) === $invalidRequestHash,
+                'The API accepted invalid UTF-8 or an unpaired JSON surrogate.');
+        }
+        $duplicatePayload = str_replace(
+            '"title":"HTTP note"',
+            '"title":"Earlier","t\\u0069tle":"HTTP note"',
+            $payload,
+            $duplicateRequestFields
+        );
+        $duplicateRequestHash = hash_file('sha256', $httpCopy);
+        [$duplicateRequestStatus] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $duplicatePayload
+        );
+        check($duplicateRequestFields === 1 && $duplicateRequestStatus === 400
+            && hash_file('sha256', $httpCopy) === $duplicateRequestHash,
+            'The API accepted escape-equivalent duplicate request fields.');
+        $missingVersionPayload = json_decode($payload, true, 16, JSON_THROW_ON_ERROR);
+        unset($missingVersionPayload['baseVersion']);
+        $beforeMissingVersion = hash_file('sha256', $httpCopy);
+        [$missingVersionStatus] = http_request(
+            "http://127.0.0.1:$port/?api=save",
+            'POST',
+            $authorizedJsonHeaders,
+            json_encode($missingVersionPayload, JSON_THROW_ON_ERROR)
+        );
+        check($missingVersionStatus === 428 && hash_file('sha256', $httpCopy) === $beforeMissingVersion,
+            'A request missing its version precondition reached mutation logic.');
+        $denseRequest = '{"dense":[' . implode(',', array_fill(0, 140, '0')) . ']}';
+        [$denseStatus, $denseHeaders] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $denseRequest
+        );
+        check($denseStatus === 413
+            && str_contains((string) header_value($denseHeaders, 'Content-Type'), 'application/json')
+            && strtolower((string) header_value($denseHeaders, 'X-Content-Type-Options')) === 'nosniff'
+            && str_contains(strtolower((string) header_value($denseHeaders, 'Cache-Control')), 'no-store'),
+            'A structurally dense request was not rejected with hardened JSON headers.');
+        $deepRequest = str_repeat('{"x":', 18) . '0' . str_repeat('}', 18);
+        [$deepStatus] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $deepRequest
+        );
+        check($deepStatus === 413, 'An over-depth request reached JSON decoding or mutation.');
         [$listRootStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, '[]');
         check($listRootStatus === 400, 'The API accepted a top-level JSON list as an object.');
-        $objectTags = json_encode(['id' => null, 'baseRevision' => 0, 'title' => 'Bad tags', 'body' => '', 'tags' => ['name' => 'not-a-list']], JSON_THROW_ON_ERROR);
+        $objectTags = json_encode([
+            'id' => null, 'baseGeneration' => $httpDocument['generation'], 'baseRevision' => 0,
+            'baseVersion' => null, 'createToken' => str_repeat('e', 32),
+            'title' => 'Bad tags', 'body' => '', 'tags' => ['name' => 'not-a-list'],
+        ], JSON_THROW_ON_ERROR);
         [$tagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $objectTags);
         check($tagStatus === 422, 'The API accepted associative tags.');
-        $numericObjectTags = '{"id":null,"baseRevision":0,"title":"Bad numeric tags","body":"","tags":{"0":"not-a-list"}}';
+        $numericObjectTags = '{"id":null,"baseGeneration":"' . $httpDocument['generation']
+            . '","baseRevision":0,"baseVersion":null,"createToken":"' . str_repeat('f', 32)
+            . '","title":"Bad numeric tags","body":"","tags":{"0":"not-a-list"}}';
         [$numericTagStatus] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $numericObjectTags);
         check($numericTagStatus === 422, 'The API confused a numeric-key JSON object with a tag list.');
 
+        $overRequestPayload = json_encode([
+            'id' => null, 'baseGeneration' => $httpDocument['generation'], 'baseRevision' => 0,
+            'baseVersion' => null, 'createToken' => str_repeat('7', 32),
+            'title' => 'Over request limit', 'body' => str_repeat('x', 5 * 1024 * 1024), 'tags' => [],
+        ], JSON_THROW_ON_ERROR);
+        $overRequestHash = hash_file('sha256', $httpCopy);
+        [$overRequestStatus] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $overRequestPayload
+        );
+        check(strlen($overRequestPayload) > 5 * 1024 * 1024 && $overRequestStatus === 413
+            && hash_file('sha256', $httpCopy) === $overRequestHash,
+            'A request above the exact 5 MiB application limit reached mutation logic.');
+        unset($overRequestPayload);
+
+        $nearRequestPayload = json_encode([
+            'id' => null, 'baseGeneration' => $httpDocument['generation'], 'baseRevision' => 0,
+            'baseVersion' => null, 'createToken' => str_repeat('8', 32),
+            'title' => 'Near request limit', 'body' => str_repeat('x', 4 * 1024 * 1024), 'tags' => [],
+        ], JSON_THROW_ON_ERROR);
+        [$nearRequestStatus, , $nearRequestBody] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $nearRequestPayload
+        );
+        $nearRequestResult = json_decode($nearRequestBody, true, 16, JSON_THROW_ON_ERROR);
+        check($nearRequestStatus === 200 && strlen($nearRequestResult['result']['body'] ?? '') === 4 * 1024 * 1024,
+            'A large request inside the configured byte/structure envelope failed.');
+        worker_command($httpCopy, 'delete', [
+            'id' => $nearRequestResult['result']['id'],
+            'baseRevision' => $nearRequestResult['result']['revision'],
+        ]);
+        unset($nearRequestPayload, $nearRequestBody, $nearRequestResult);
+
+        $exactRequestPayload = json_encode([
+            'id' => null, 'baseGeneration' => $httpDocument['generation'], 'baseRevision' => 0,
+            'baseVersion' => null, 'createToken' => str_repeat('6', 32),
+            'title' => 'Exact request limit', 'body' => '', 'tags' => [],
+        ], JSON_THROW_ON_ERROR);
+        $exactRequestPadding = 5 * 1024 * 1024 - strlen($exactRequestPayload);
+        $exactRequestPayload = str_replace('"body":""', '"body":"' . str_repeat('x', $exactRequestPadding) . '"',
+            $exactRequestPayload, $exactRequestReplacements);
+        [$exactRequestStatus, , $exactRequestBody] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $exactRequestPayload
+        );
+        $exactRequestResult = json_decode($exactRequestBody, true, 16, JSON_THROW_ON_ERROR);
+        check($exactRequestReplacements === 1 && strlen($exactRequestPayload) === 5 * 1024 * 1024
+            && $exactRequestStatus === 200
+            && strlen($exactRequestResult['result']['body'] ?? '') === $exactRequestPadding,
+            'A request at the exact 5 MiB application limit was rejected or changed.');
+        worker_command($httpCopy, 'delete', [
+            'id' => $exactRequestResult['result']['id'],
+            'baseRevision' => $exactRequestResult['result']['revision'],
+        ]);
+        unset($exactRequestPayload, $exactRequestBody, $exactRequestResult);
+
+        $lockHolder = start_worker($httpCopy, 'held-save', ['hold' => 2700000, 'title' => 'Lock holder']);
+        usleep(150000);
+        $busyPayload = json_encode([
+            'id' => null, 'baseGeneration' => $httpDocument['generation'], 'baseRevision' => 0,
+            'baseVersion' => null, 'createToken' => str_repeat('9', 32),
+            'title' => 'Must time out', 'body' => '', 'tags' => [],
+        ], JSON_THROW_ON_ERROR);
+        $busyStarted = microtime(true);
+        [$busyStatus, $busyHeaders] = http_request(
+            "http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $busyPayload
+        );
+        $busyElapsed = microtime(true) - $busyStarted;
+        check($busyStatus === 503 && header_value($busyHeaders, 'Retry-After') === '1'
+            && $busyElapsed >= 1.7 && $busyElapsed < 3.5
+            && glob($httpRoot . '/.piplet-tmp-*.php') === [],
+            'Lock contention did not terminate at the shared deadline with a retryable response.');
+        $heldResult = finish_worker($lockHolder)['value'];
+        worker_command($httpCopy, 'delete', [
+            'id' => $heldResult['result']['id'], 'baseRevision' => $heldResult['result']['revision'],
+        ]);
+
+        $beforeHttpAppearanceRevision = worker_command($httpCopy, 'read')['revision'];
         [$appearanceStatus, , $appearanceBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', $authorizedJsonHeaders, $appearancePayload);
         $appearanceResponse = json_decode($appearanceBody, true, 16, JSON_THROW_ON_ERROR);
-        $expectedHttpAppearance = ['revision' => 2] + $httpAppearanceValues;
-        check($appearanceStatus === 200 && $appearanceResponse['result'] === $expectedHttpAppearance
-            && $appearanceResponse['documentRevision'] === 2, 'A valid HTTP appearance save failed.');
+        $expectedHttpAppearance = $appearanceResponse['result'] ?? [];
+        check($appearanceStatus === 200
+            && ($expectedHttpAppearance['revision'] ?? null) === $beforeHttpAppearanceRevision + 1
+            && array_diff_key($expectedHttpAppearance, ['revision' => true, 'version' => true]) === $httpAppearanceValues
+            && $appearanceResponse['documentRevision'] === $beforeHttpAppearanceRevision + 1,
+            'A valid HTTP appearance save failed.');
 
         [$appearanceGetStatus, , $appearancePage] = http_request("http://127.0.0.1:$port/", 'GET', ["Cookie: $cookie"]);
         check($appearanceGetStatus === 200, 'The app failed after an HTTP appearance save.');
@@ -2190,13 +3339,11 @@ PHP;
         }
         check(str_contains($appearancePage, '<style nonce=') && str_contains($appearancePage, 'id="piplet-custom-style"></style>'), 'The custom CSS module is not structurally empty.');
         check(!str_contains($appearancePage, '</style><script id="css-pwn">'), 'Custom CSS was interpolated into live HTML.');
-        check(preg_match('/<script type="application\/json" id="piplet-state"[^>]*>(.*?)<\/script>/s', $appearancePage, $stateMatch) === 1, 'The appearance state block is missing.');
-        $appearanceState = json_decode($stateMatch[1], true, 32, JSON_THROW_ON_ERROR);
+        $appearanceState = page_state($appearancePage);
         check($appearanceState['appearance']['customCss'] === $hostileCss && $appearanceState['safeAppearance'] === false, 'Custom CSS did not round-trip through the inert state block.');
         [$safeStatus, , $safePage] = http_request("http://127.0.0.1:$port/?safe=1", 'GET', ["Cookie: $cookie"]);
         check($safeStatus === 200 && str_contains($safePage, 'Custom CSS is off for this page.'), 'Safe appearance mode is unavailable.');
-        check(preg_match('/<script type="application\/json" id="piplet-state"[^>]*>(.*?)<\/script>/s', $safePage, $safeStateMatch) === 1, 'Safe mode lost the appearance state block.');
-        $safeState = json_decode($safeStateMatch[1], true, 32, JSON_THROW_ON_ERROR);
+        $safeState = page_state($safePage);
         check($safeState['safeAppearance'] === true && $safeState['appearance']['customCss'] === $hostileCss, 'Safe mode erased the editable CSS instead of only disabling it.');
         $appearanceHash = hash_file('sha256', $httpCopy);
         [$appearanceStaleStatus, , $appearanceStaleBody] = http_request("http://127.0.0.1:$port/?api=appearance", 'POST', $authorizedJsonHeaders, $appearancePayload);
@@ -2204,8 +3351,12 @@ PHP;
         check($appearanceStaleStatus === 409 && $appearanceStaleResponse['current'] === $expectedHttpAppearance, 'The appearance API did not return the current record for a stale save.');
         check(hash_file('sha256', $httpCopy) === $appearanceHash, 'A stale HTTP appearance save changed the file.');
 
-        [$postStatus, , $postBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $payload);
+        [$postStatus, $postHeaders, $postBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $payload);
         check($postStatus === 200, 'A valid HTTP save failed.');
+        check(str_contains((string) header_value($postHeaders, 'Content-Type'), 'application/json')
+            && strtolower((string) header_value($postHeaders, 'X-Content-Type-Options')) === 'nosniff'
+            && str_contains(strtolower((string) header_value($postHeaders, 'Cache-Control')), 'no-store'),
+            'Successful API JSON lost its no-sniff or no-store boundary.');
         $post = json_decode($postBody, true, 16, JSON_THROW_ON_ERROR);
         check($post['result']['title'] === 'HTTP note', 'The HTTP response returned the wrong note.');
         $postHash = hash_file('sha256', $httpCopy);
@@ -2220,12 +3371,25 @@ PHP;
         [$secondGetStatus, , $secondPage] = http_request("http://127.0.0.1:$port/", 'GET', ["Cookie: $cookie"]);
         check($secondGetStatus === 200, 'The app failed after an HTTP save.');
         check(!str_contains($secondPage, '<img src=x onerror=alert(1)>'), 'Stored markup was embedded as live HTML.');
-        check(str_contains($secondPage, '\\u003Cimg src=x onerror=alert(1)\\u003E'), 'Stored markup was not safely represented in boot data.');
+        $secondState = page_state($secondPage);
+        check(str_contains($secondState['document']['notes'][$post['result']['id']]['body'], '<img src=x onerror=alert(1)>'),
+            'Stored markup did not round-trip through base64 boot data.');
 
         [$downloadStatus, $downloadHeaders, $downloadBody] = http_request("http://127.0.0.1:$port/?download=1", 'GET', ["Cookie: $cookie"]);
         check($downloadStatus === 200 && str_starts_with($downloadBody, '<?php'), 'Snapshot download failed.');
+        check(header_value($downloadHeaders, 'Content-Type') === 'application/octet-stream'
+            && strtolower((string) header_value($downloadHeaders, 'X-Content-Type-Options')) === 'nosniff'
+            && strtolower((string) header_value($downloadHeaders, 'Cache-Control')) === 'no-store'
+            && header_value($downloadHeaders, 'Content-Disposition') === 'attachment; filename="piplet-snapshot.php"',
+            'Snapshot download headers permit sniffing or an ambiguous filename.');
         check((int) header_value($downloadHeaders, 'Content-Length') === strlen($downloadBody), 'Snapshot Content-Length did not match its inode.');
         check($downloadBody === file_get_contents($httpCopy), 'The downloaded snapshot was not an exact restorable copy.');
+        [$headDownloadStatus, $headDownloadHeaders, $headDownloadBody] = http_request(
+            "http://127.0.0.1:$port/?download=1", 'HEAD', ["Cookie: $cookie"]
+        );
+        check($headDownloadStatus === 200 && $headDownloadBody === ''
+            && (int) header_value($headDownloadHeaders, 'Content-Length') === strlen($downloadBody),
+            'HEAD download did not return exact snapshot headers without a body.');
         $downloadCopy = $httpRoot . '/downloaded.php';
         check(file_put_contents($downloadCopy, $downloadBody) === strlen($downloadBody), 'Could not materialize the downloaded snapshot test.');
         $downloadLint = run_bounded_command([PHP_BINARY, '-l', $downloadCopy]);
@@ -2240,7 +3404,7 @@ PHP;
                 try {
                     $browserResult = run_browser_scenario(
                         $chrome,
-                        "http://127.0.0.1:$port/?__browser=state",
+                        "$browserBase/?__browser=state",
                         $temporaryRoot . '/chrome-profile',
                         $browserSignal,
                         'state'
@@ -2254,14 +3418,24 @@ PHP;
             }
             $browserProgress = @file_get_contents($httpRoot . '/browser-progress.log') ?: 'no progress';
             check($browserResult === 'PASS', "Browser regression failed: $browserResult\nProgress:\n$browserProgress");
+            $longPathResult = run_browser_scenario(
+                $chrome,
+                "$browserBase/$longPathSegment/index.php?__browser=long-path",
+                $temporaryRoot . '/chrome-long-path-profile',
+                $longPathSignal,
+                'long-path'
+            );
+            $longPathProgress = @file_get_contents($longPathSignal) ?: 'no progress';
+            check($longPathResult === 'PASS',
+                "Long-path browser regression failed: $longPathResult\nProgress:\n$longPathProgress");
             $safeAppearance = worker_command($httpCopy, 'current-appearance');
-            $safeAppearanceValues = array_diff_key($safeAppearance, ['revision' => true]);
+            $safeAppearanceValues = array_diff_key($safeAppearance, ['revision' => true, 'version' => true]);
             $safeAppearanceValues['customCss'] = 'html { display: none !important; }';
             worker_command($httpCopy, 'appearance', ['baseRevision' => $safeAppearance['revision'], 'appearance' => $safeAppearanceValues]);
             check(file_put_contents($browserSignal, '') === 0, 'Could not reset the safe-mode browser completion signal.');
             $safeResult = run_browser_scenario(
                 $chrome,
-                "http://127.0.0.1:$port/?safe=1&__browser=safe",
+                "$browserBase/?safe=1&__browser=safe",
                 $temporaryRoot . '/chrome-safe-profile',
                 $browserSignal,
                 'safe'
@@ -2273,7 +3447,7 @@ PHP;
             try {
                 $mobileResult = run_browser_scenario(
                     $chrome,
-                    "http://127.0.0.1:$port/?__browser=mobile",
+                    "$browserBase/?__browser=mobile",
                     $temporaryRoot . '/chrome-mobile-profile',
                     $browserSignal,
                     'mobile',
@@ -2286,27 +3460,55 @@ PHP;
             $mobileProgress = @file_get_contents($httpRoot . '/browser-progress.log') ?: 'no progress';
             check($mobileResult === 'PASS', "Mobile browser regression failed: $mobileResult\nProgress:\n$mobileProgress");
         } else {
+            check(getenv('PIPLET_REQUIRE_CHROME') !== '1',
+                'Chrome is required for this run, but no Chrome or Chromium executable was found.');
             check(str_contains($httpSource, 'if (noteSaving || editing !== editor) return;'), 'The browser save-flight guard is missing.');
+            check(substr_count($httpSource, "location.pathname.replace(/^\\/+/, '/')") >= 2
+                && !str_contains($httpSource, '`${location.pathname}${location.search}'),
+                'History updates can reinterpret a double-leading-slash path as another origin.');
             check(str_contains($httpSource, 'return renderPlainBody(body, preview);'), 'The bounded-renderer fallback is missing.');
             check(str_contains($httpSource, 'recoverReadOnlyDraft'), 'The read-only draft recovery guard is missing.');
             check(str_contains($httpSource, 'const maxOpenNotes = 20;') && str_contains($httpSource, 'const maxLibraryNotes = 40;'), 'The aggregate rendering guards are missing.');
-            check(str_contains($httpSource, "id === null ? '@new' : id") && str_contains($httpSource, "draft.id !== null && draft.id !== 'new'"), 'The null-ID draft namespace or legacy migration guard is missing.');
+            check(str_contains($httpSource, '`${draftPrefix}v2:${source.draftId}`')
+                && str_contains($httpSource, "typeof expectedRaw === 'string' && raw !== expectedRaw")
+                && str_contains($httpSource, 'stored?.draftId !== draftId')
+                && str_contains($httpSource, 'removeStoredDraft(source.recoveryKey, source.recoveryRaw, source.draftId)')
+                && !str_contains($httpSource, 'previousDraftKeys(source)'),
+                'The immutable random-key recovery boundary is missing.');
             check(str_contains($httpSource, 'article.id = editor.id === null ? \'piplet-composer\' : `piplet-note-${editor.id}`;'), 'Saved notes and the composer no longer have separate DOM namespaces.');
             check(str_contains($httpSource, "els['drawer-shade'].tabIndex = -1;") && !str_contains($httpSource, ", els['drawer-shade']];"), 'The modal drawer focus guard includes its outside backdrop.');
             check(str_contains($httpSource, "boot.safeAppearance ? '' : values.customCss"), 'The safe-mode custom CSS guard is missing.');
             fwrite(STDOUT, "skip — Chrome unavailable; dynamic browser regressions were not run\n");
         }
 
-        $deletePayload = json_encode(['id' => $post['result']['id'], 'baseRevision' => $post['result']['revision']], JSON_THROW_ON_ERROR);
+        $beforeDeleteDocument = worker_command($httpCopy, 'read');
+        $beforeDeleteNote = $beforeDeleteDocument['notes'][$post['result']['id']] ?? null;
+        check(is_array($beforeDeleteNote), 'The browser scenarios lost the HTTP note used for delete testing.');
+        $deletePayload = json_encode([
+            'id' => $beforeDeleteNote['id'],
+            'baseGeneration' => $beforeDeleteDocument['generation'],
+            'baseRevision' => $beforeDeleteNote['revision'],
+            'baseVersion' => $beforeDeleteNote['version'],
+        ], JSON_THROW_ON_ERROR);
         [$deleteStatus] = http_request("http://127.0.0.1:$port/?api=delete", 'POST', $authorizedJsonHeaders, $deletePayload);
         check($deleteStatus === 200, 'A current HTTP delete failed.');
         $hashAfterDelete = hash_file('sha256', $httpCopy);
-        $stalePayload = json_encode(['id' => $post['result']['id'], 'baseRevision' => $post['result']['revision'], 'title' => 'Stale after delete', 'body' => 'draft', 'tags' => []], JSON_THROW_ON_ERROR);
+        $stalePayload = json_encode([
+            'id' => $beforeDeleteNote['id'],
+            'baseGeneration' => $beforeDeleteDocument['generation'],
+            'baseRevision' => $beforeDeleteNote['revision'],
+            'baseVersion' => $beforeDeleteNote['version'],
+            'createToken' => null,
+            'title' => 'Stale after delete',
+            'body' => 'draft',
+            'tags' => [],
+        ], JSON_THROW_ON_ERROR);
         [$staleStatus, , $staleBody] = http_request("http://127.0.0.1:$port/?api=save", 'POST', $authorizedJsonHeaders, $stalePayload);
         $staleResponse = json_decode($staleBody, true, 16, JSON_THROW_ON_ERROR);
         check($staleStatus === 409 && array_key_exists('current', $staleResponse) && $staleResponse['current'] === null, 'A stale edit after deletion did not return 409/current:null.');
         check(hash_file('sha256', $httpCopy) === $hashAfterDelete, 'A stale edit after deletion changed the file.');
     } finally {
+        $defaultHttpHeaders = [];
         @chmod($httpRoot, 0700);
         stop_test_server($server, 'HTTP');
     }
@@ -2316,7 +3518,7 @@ PHP;
     [$closedServer, $closedPort] = start_test_server($closedRoot, test_environment(), 'Could not start the deny-by-default server.');
     try {
         [$closedStatus] = http_request("http://127.0.0.1:$closedPort/", 'GET', ['Host: localhost', 'X-Forwarded-For: 127.0.0.1']);
-        check($closedStatus === 403, 'Passwordless HTTP was enabled without an explicit local-development opt-in.');
+        check($closedStatus === 403, 'HTTP access was enabled without a configured password.');
     } finally {
         stop_test_server($closedServer, 'deny-by-default');
     }
@@ -2325,7 +3527,7 @@ PHP;
     $authRoot = dirname($authCopy);
     [$authServer, $authPort] = start_test_server(
         $authRoot,
-        test_environment(['PIPLET_PASSWORD' => 'correct horse battery staple']),
+        test_environment(['PIPLET_PASSWORD' => 'correct horse battery staple', 'PIPLET_PUBLIC_HTTPS' => '1']),
         'Could not start the authenticated test server.'
     );
     try {
@@ -2339,8 +3541,18 @@ PHP;
         check($wrongStatus === 401, 'Password mode accepted a wrong password.');
         [$wrongApiStatus] = http_request("http://127.0.0.1:$authPort/?api=delete", 'POST', ['Authorization: Basic ' . base64_encode('writer:wrong'), 'Content-Type: application/json'], '{}');
         check($wrongApiStatus === 401 && hash_file('sha256', $authRoot . '/index.php') === $authHash, 'Wrong-password API access changed the protected piplet.');
-        [$correctStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic ' . base64_encode('writer:correct horse battery staple')]);
-        check($correctStatus === 200, 'Password mode rejected the configured password.');
+        [$correctStatus, $correctHeaders] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic ' . base64_encode('writer:correct horse battery staple')]);
+        $secureCookie = (string) header_value($correctHeaders, 'Set-Cookie');
+        check($correctStatus === 200 && preg_match('/(?:^|;)\s*Secure(?:;|$)/i', $secureCookie) === 1,
+            'Password mode rejected the configured password or failed to mark a public-HTTPS cookie Secure.');
+        check(preg_match('/^([^=]+)=([^;]+)/', $secureCookie, $secureCookieParts) === 1,
+            'Could not parse the public-HTTPS CSRF cookie.');
+        [, $reissuedHeaders] = http_request("http://127.0.0.1:$authPort/", 'GET', [
+            'Authorization: Basic ' . base64_encode('writer:correct horse battery staple'),
+            'Cookie: ' . $secureCookieParts[1] . '=' . $secureCookieParts[2],
+        ]);
+        check(preg_match('/(?:^|;)\s*Secure(?:;|$)/i', (string) header_value($reissuedHeaders, 'Set-Cookie')) === 1,
+            'An existing CSRF cookie was not reissued with the public-HTTPS policy.');
         [$lowercaseStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: basic ' . base64_encode('writer:correct horse battery staple')]);
         check($lowercaseStatus === 200, 'The fallback parser treated the Basic authentication scheme as case-sensitive.');
         [$spacedStatus] = http_request("http://127.0.0.1:$authPort/", 'GET', ['Authorization: Basic  ' . base64_encode('writer:correct horse battery staple')]);
@@ -2349,10 +3561,30 @@ PHP;
         stop_test_server($authServer, 'authenticated');
     }
 
+    $runnerWebRoot = $temporaryRoot . '/runner-web';
+    check(mkdir($runnerWebRoot, 0700) && copy(__FILE__, $runnerWebRoot . '/run.php'),
+        'Could not create the isolated runner-exposure fixture.');
+    [$runnerServer, $runnerPort] = start_test_server(
+        $runnerWebRoot,
+        test_environment(),
+        'Could not start the runner-exposure test server.'
+    );
+    try {
+        [$runnerStatus, , $runnerBody] = http_request(
+            "http://127.0.0.1:$runnerPort/run.php?--worker=../piplet.php"
+        );
+        check($runnerStatus === 404 && trim($runnerBody) === 'Not found.'
+            && hash_file('sha256', __FILE__) === $runnerHashBefore
+            && hash_file('sha256', $source) === $sourceHashBefore,
+            'The CLI test runner exposed its worker surface over HTTP.');
+    } finally {
+        stop_test_server($runnerServer, 'runner-exposure');
+    }
+
     check(hash_file('sha256', $source) === $sourceHashBefore, 'The test runner changed the source piplet.');
     $successMessage = sprintf("ok — %d assertions; source file untouched; 7+ MiB cycle %.2fs (worker peak %.1f MiB)\n", $assertions, $largeElapsed, $largePeak / 1024 / 1024);
 } catch (Throwable $error) {
-    fwrite(STDERR, "not ok — {$error->getMessage()}\n");
+    fwrite(STDERR, "not ok — {$error->getMessage()} ({$error->getFile()}:{$error->getLine()})\n");
     $exitStatus = 1;
 } finally {
     if (!stop_live_workers()) {

@@ -7,40 +7,82 @@ piplet.php
 ├── PHP persistence and HTTP API
 ├── HTML, editable CSS, and browser UI
 ├── __halt_compiler();
-├── PIPLET-DATA/1
-└── { versioned JSON notes and appearance }
+├── PIPLET-DATA/2
+└── { generation, versioned JSON notes, and appearance }
 ```
 
 ## Run it
 
-PHP 8.1 or newer is required.
+64-bit PHP 8.1 or newer is required. Every HTTP request requires a password, including requests from loopback. For local development, initialize a persistent private document root once. The guard deliberately refuses to overwrite an existing notebook:
 
 ```sh
-PIPLET_ALLOW_PASSWORDLESS=1 php -S 127.0.0.1:8080
+install -d -m 700 /absolute/private/piplet-local &&
+test ! -e /absolute/private/piplet-local/index.php &&
+install -m 600 piplet.php /absolute/private/piplet-local/index.php
 ```
 
-Then open `http://127.0.0.1:8080/piplet.php`.
-
-Apache and Nginx/PHP-FPM deployments are intentionally not turnkey: configure `PIPLET_PASSWORD` in the PHP worker environment, route every request for the piplet and its temporary `.php` names through PHP, deny dotfiles and names containing `.piplet-tmp-`, and use TLS. The PHP process must be able to read the file and write its containing directory because saves create a temporary snapshot beside the file and atomically rename it into place. The exact virtual-host/FPM syntax is server- and distribution-specific; do not deploy until those four requirements are verified.
-
-Password-free access is off by default. `PIPLET_ALLOW_PASSWORDLESS=1` enables it only for PHP's built-in server with a loopback peer and a strict loopback `Host`; use that switch only for a server bound directly to loopback. piplet cannot distinguish a local browser from a loopback reverse proxy, so the operator must never pass that switch through a proxy. Apache, PHP-FPM, reverse proxies, and remote access must set a password. For example, run the backend on loopback and put it behind a TLS-terminating proxy:
+Start and restart it separately; never repeat the install command over the stateful copy:
 
 ```sh
-PIPLET_PASSWORD='choose-a-long-password' php -S 127.0.0.1:8080
+PIPLET_PASSWORD='choose-a-long-random-password' \
+  php -S 127.0.0.1:8080 -t /absolute/private/piplet-local \
+  /absolute/private/piplet-local/index.php
 ```
 
-That uses HTTP Basic authentication. Use HTTPS whenever traffic leaves your machine. piplet is intended for one person or a small trusted group; it does not have accounts, roles, or a merge editor.
+Then open `http://127.0.0.1:8080/`. Do not serve the repository: tests, backups, benchmark files, and temporary artifacts do not belong in the document root.
+
+For a real deployment, use a dedicated HTTPS origin containing only `index.php`. Configure `PIPLET_PASSWORD` in the PHP worker environment, deny every other path and dotfile at the web server, and make the backend unreachable except through the TLS proxy. The PHP process must be able to read the file and write its containing directory because a save creates a private temporary snapshot beside the file and atomically renames it into place.
+
+If TLS terminates at a trusted proxy, set `PIPLET_PUBLIC_HTTPS=1` so CSRF cookies are marked `Secure`. piplet deliberately ignores `Forwarded` and `X-Forwarded-*`; accepting those from clients would let them choose the cookie policy. Never set the flag for a publicly reachable plain-HTTP origin.
+
+```sh
+PIPLET_PASSWORD='choose-a-long-random-password' \
+PIPLET_PUBLIC_HTTPS=1 \
+  php-fpm
+```
+
+Authentication is HTTP Basic, so TLS is mandatory whenever traffic can leave the machine. piplet is intended for one person or a small trusted group; it has no accounts, roles, audit log, or merge editor. Put no other application or user-controlled content on its origin: same-origin access would also grant access to piplet's authenticated API and browser storage.
 
 ## Use it
 
 - `New note` creates an in-place editor.
 - `Ctrl/⌘ S` saves; `Esc` cancels; `/` searches; `N` creates; `E` edits the first open note.
-- Drafts whose serialized recovery record is at most 524,288 JavaScript string units survive an accidental navigation in `sessionStorage`, subject to the browser's own quota. Only an explicit save changes the PHP file. If recovery storage is full or a draft is larger, piplet keeps that editor open and asks you to save before switching. A later read-only launch still exposes an available browser recovery draft for copying.
+- Drafts whose serialized recovery record is at most 524,288 JavaScript string units survive an accidental navigation in `sessionStorage`, subject to the browser's own quota. Each draft receives an immutable random physical key; legacy recovery records are copied to that format before editing, and recovery records cannot name other keys to delete. Discovery inspects and accounts for at most 2,048 keys and 2 MiB of recovery text. On reload, piplet opens an available recovery before showing saved content. Only an explicit save changes the PHP file. If recovery storage is full or a draft is larger, piplet keeps that editor open and asks you to save before switching. A later read-only launch exposes an available browser recovery draft, including exact title and tag JSON, for copying.
 - Note bodies support headings, lists, block quotes, fenced code, `**bold**`, inline backticks, and `[[label|note-id]]` links.
 - `Appearance` previews and saves a coordinated palette, reading font, text size, line length, and an optional custom stylesheet.
-- `Download a snapshot` exports a runnable backup: restoring it restores both app and notes.
+- `Download a snapshot` exports the current file. Keep it as a backup, but restore its data through the trusted current executable rather than replacing a live deployment with old code.
 
-Two editors can safely change different notes. Each note and the shared appearance carry revisions. A stale note save returns HTTP 409 with explicit keep/replace choices; a stale appearance save keeps the local preview and asks you to cancel or save again. New-note requests carry a stable creation token, so retrying after a lost response does not create a second slug while the original note exists.
+Two editors can safely change different notes. The document has a generation, and every note and appearance record has a random version plus a display revision. A stale, deleted/recreated, forked, or rekeyed record returns HTTP 409 with explicit recovery choices. New-note requests carry a stable creation token, so retrying after a lost response does not create a second slug while the original note exists.
+
+## Security boundary
+
+The safe version is designed to protect note integrity against hostile HTTP input, stale clients, ordinary process crashes, and stored markup. It does not protect against an attacker who can replace `index.php`, write its directory, read the configured password, control the TLS proxy, or execute code as the PHP user.
+
+Before exposing it beyond loopback, verify all of these:
+
+- The deployment has its own origin and private document root. Only the canonical `index.php` route is public; dotfiles, `.piplet-tmp-*`, tests, source-control metadata, snapshots, and backups are denied or stored elsewhere.
+- The directory is owned by the deployment account and normally mode `0700` (or a reviewed `0750` group setup); the file is normally `0600` (or reviewed `0640`). No untrusted local user can write the directory or create hard links to the file.
+- TLS is enforced before credentials are sent. The backend listens on a private socket/address, the proxy strips client forwarding headers, and `PIPLET_PUBLIC_HTTPS=1` is set only when every public request is HTTPS.
+- The proxy accepts at most 5 MiB request bodies, a 4 KiB request target, at most 64 headers, and at most 8 KiB per header/32 KiB in aggregate. It rejects duplicate or conflicting `Host`, `Content-Length`, `Transfer-Encoding`, and `Authorization` fields; rejects `Content-Length` plus `Transfer-Encoding`; does not decompress request bodies; enforces header/body deadlines and the same limit for fixed and chunked bodies; forwards one normalized `Authorization` value; rate-limits failed authentication and successful reads/downloads; rejects cross-origin browser subresources using Fetch Metadata; and uses a bounded request/writer queue. piplet applies the same Fetch Metadata isolation when those browser headers are present, but the proxy is the cheaper enforcement point. PHP uses `memory_limit=128M` or higher and provides `flock`, `fsync`, atomic same-filesystem `rename`, and a local POSIX filesystem.
+- Backups are private and tested. OPcache validates timestamps, or is explicitly invalidated when application code is deployed. NFS/SMB, multiple hosts, serverless filesystems, and online raw-file replacement are unsupported.
+
+The response CSP blocks remote scripts, frames, workers, styles, fonts, and images except inline nonce-authorized application code and `data:` images. Note and boot data cross into the DOM as text/base64 rather than HTML. Custom CSS remains deliberately powerful: it can hide or restyle the interface, but CSP prevents it from becoming script or loading remote assets.
+
+### Check, restore, and rekey
+
+Run the trusted current executable for integrity checks and restores:
+
+```sh
+php /srv/piplet/index.php --check
+php /srv/piplet/index.php --rekey
+php /srv/piplet/index.php \
+  --import-snapshot-data /offline/backups/piplet-2026-08-18.php \
+  --rekey
+```
+
+For an import, stop or drain the proxy and PHP workers first. Save the current target and its hash, run the command above, run `--check`, verify owner/mode, restart PHP or invalidate OPcache, then test a read and save before reopening traffic. The current executable reads the backup as bounded data—it never includes or executes its PHP prefix—and can replace a corrupt old trailer while retaining the running trusted prefix. Rekey rotates the document generation and every record version and resets display revisions to a safe baseline. Raw overwrite while serving is unsupported and can both lose concurrent work and restore an old executable vulnerability.
+
+Rekey after an intentional restore or suspected snapshot fork. Generation/version checks detect divergent histories, delete/recreate ABA, and most rollback cases. They cannot detect an exact rollback to the same generation and versions a client already loaded; that requires trusted state outside this one file, such as an append-only log or database.
 
 ## Change the appearance
 
@@ -56,25 +98,28 @@ The built-in presets are coordinated and contrast-aware; custom CSS is deliberat
 
 ## How a save works
 
-1. Open this PHP file and take an exclusive advisory lock.
+1. Open this PHP file and attempt an exclusive advisory lock without blocking indefinitely. All inode retries share a two-second monotonic deadline; contention returns `503` with `Retry-After: 1`.
 2. Compare the open descriptor's device/inode with the path's current device/inode. If another save replaced it while this process waited, retry on the current file.
-3. Read and validate the marked JSON trailer while holding the live-file lock.
-4. Check the note or appearance base revision and apply one mutation.
-5. Write the unchanged code prefix plus new JSON to a random, same-directory `.php` temporary file; flush and `fsync` it; preserve its mode bits.
+3. Read the marked JSON trailer while holding the live-file lock. Bounded structural, duplicate-member, and lossless-number scans run before `json_decode`, followed by schema, cardinality, UTF-8, revision, generation, and record-version validation.
+4. Check the supplied generation, revision, and record version, then apply one mutation. Format-1 data receives deterministic virtual identities on read and is materialized as format 2 on its first successful mutation.
+5. Calculate the exact encoded size before creating a temporary file. Write the unchanged code prefix, format-2 marker, JSON, and newline in 64 KiB chunks to a private same-directory `.php` file; flush, `fsync`, preserve mode bits, and `fsync` again. Saving is disabled if PHP does not provide `fsync`.
 6. Revalidate the target inode and atomically `rename()` the temporary snapshot over the original.
 
-The inode retry is the small but important detail that allows one durable filesystem entry without a permanent lock sidecar. A naïve `flock(__FILE__)` is incorrect after `rename()`: a waiting writer may acquire a lock on the old, unlinked inode and overwrite a newer save.
+The inode retry is the small but important detail that safely updates one canonical filesystem path without a permanent lock sidecar. A naïve `flock(__FILE__)` is incorrect after `rename()`: a waiting writer may acquire a lock on the old, unlinked inode and overwrite a newer save.
 
-Stored note text is never evaluated as PHP and is added to the page with DOM text nodes. The JSON embedded in HTML uses the `JSON_HEX_*` escapes, mutations require JSON plus a same-origin CSRF header/cookie pair, and the response ships a restrictive Content Security Policy.
+Stored note text is never evaluated as PHP and is added to the page with DOM text nodes. Browser boot state is base64 inside an inert element, so attacker-controlled data cannot form an HTML end tag. Mutations require an exact JSON object plus a same-origin header matching a path-scoped, HttpOnly, `SameSite=Lax` CSRF cookie; the Lax policy also keeps a top-level link from rotating the token in an already-open editor. JSON responses are `no-store` and `nosniff`.
 
 ## Limits
 
-- Supported deployment: PHP 8.1+ on a local POSIX filesystem. NFS/SMB, multi-host writers, serverless/immutable filesystems, hard-linked aliases, and Windows have not been tested.
-- The whole file is copied on every save. The configured ceiling is 8 MiB.
-- Rendering is bounded: the story keeps at most 20 open notes and the index shows the newest 40 matches. Search still reaches older notes.
+- Supported deployment: 64-bit PHP 8.1+ on a local POSIX filesystem. NFS/SMB, multi-host writers, serverless/immutable filesystems, hard-linked aliases, and Windows are unsupported.
+- The whole file is read and replaced on every save. The configured file ceiling is 8 MiB; request JSON is capped at 5 MiB, stored notes at 2,000, and tag references at 24,000. Structural/depth limits apply before JSON decoding.
+- Rendering is bounded: the story keeps at most 20 open notes, rich rendering has per-note and aggregate character/node budgets, and the index shows the newest 40 matches. Search still reaches older notes.
 - The containing directory is briefly home to one high-entropy temporary `.php` file during a save. It starts at mode `0600`, is removed on handled failure, and is renamed on success. A hard process kill at any point after temporary-file creation can leave a hidden orphan; after verifying the canonical piplet, that orphan can be deleted.
-- Atomic rename prevents torn reads and `fsync` protects the temporary contents, but portable PHP cannot `fsync` the containing directory. A sudden power loss can lose the latest rename even though it will not expose a half-written canonical file.
+- Atomic rename prevents torn canonical reads and file `fsync` protects the temporary contents, but portable PHP cannot `fsync` the containing directory. A sudden power loss can lose the latest rename even though ordinary process crashes leave the canonical path as a complete old or new file.
 - Atomic replacement can change ownership to the PHP process and does not preserve ACLs or extended attributes. Ordinary permission bits are preserved.
+- Advisory locks coordinate only cooperating processes using the same local inode. A local administrator, deployment tool, backup restore, or other program can bypass them.
+- Browser recovery is best-effort. Quota, privacy settings, crashes, extensions, or same-origin code can remove or deny it.
+- HTML text editing uses the browser's standard newline model: CR and CRLF become LF when the affected title or body is edited.
 - A web-writable PHP file is intentionally unusual. Keep backups and do not deploy it where policy or hardening rules forbid self-modifying code.
 
 ## Unsafe simple version
@@ -93,10 +138,13 @@ The dependency-free test runner always copies the application to a unique tempor
 
 ```sh
 php tests/run.php
+PIPLET_REQUIRE_CHROME=1 php tests/run.php
 php tests/unsafe-run.php
 ```
 
-It covers CRUD, idempotent creates, appearance and legacy-token migration, stale revisions, private temporary files, hostile/Unicode text and CSS, immutable-prefix preservation, PHP linting after saves, HTTP/auth/CSRF behavior, multi-megabyte snapshots, and concurrent writers queued across inode replacements. When Chrome or Chromium is available, it also runs real browser regressions for held/double saves, conflict and read-only draft recovery, unavailable browser storage, bounded story/index rendering, theme-only saves, full CSS previews, safe appearance mode, and mobile focus. Without Chrome, the runner reports that those dynamic browser scenarios were skipped and performs only static guard checks for their critical code paths.
+It covers CRUD, idempotent creates, format-1 migration, format-2 generation/version conflicts, rekeyed browser recoveries, import/rekey, exact title/tag values, malformed Unicode, JSON/cardinality limits, exact byte ceilings, size projection, mandatory synchronization, private temporary files, crash checkpoints, a held-lock deadline, hostile Unicode/HTML/CSS, immutable-prefix preservation, HTTP authentication/CSRF/cookie behavior, multi-megabyte snapshots, and concurrent writers across inode replacements. It also verifies that the runner itself returns 404 under a web SAPI.
+
+When Chrome or Chromium is available, the suite runs real browser regressions for held/double saves, lost responses, conflicts, random immutable recovery records, read-only exact-value recovery, unavailable browser storage, bounded story/index rendering, base64 boot transport, theme-only saves, full CSS previews, safe appearance mode, and mobile focus. Without Chrome, it reports that dynamic scenarios were skipped and performs static checks only; a skip is not evidence that the browser boundary passed. Set `PIPLET_REQUIRE_CHROME=1` to make a missing browser fail the run, as release and security validation should.
 
 ## License
 
