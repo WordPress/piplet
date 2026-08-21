@@ -15,11 +15,11 @@ wiki-piplet.php
 
 ### Full version
 
-https://github.com/user-attachments/assets/afab8ce7-be35-4029-82b7-d8b09dccc09a
+https://github.com/user-attachments/assets/87a2f715-31d8-478a-8dbe-cc641d7865c0
 
 ### Unsafe version
 
-https://github.com/user-attachments/assets/441c2af5-2ff9-4c05-ad9d-07c4679b8f89
+https://github.com/user-attachments/assets/267b7f6f-9739-47da-a813-a336d66a69fc
 
 ## Run it
 
