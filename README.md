@@ -13,15 +13,13 @@ wiki-piplet.php
 
 ## Demos
 
-Click a preview to watch the corresponding MP4.
-
 ### Full version
 
-[![Watch the full piplet demo](wiki-piplet-demo.jpg)](wiki-piplet-demo.mp4)
+https://github.com/user-attachments/assets/afab8ce7-be35-4029-82b7-d8b09dccc09a
 
 ### Unsafe version
 
-[![Watch the unsafe piplet demo](wiki-piplet-unsafe-demo.jpg)](wiki-piplet-unsafe-demo.mp4)
+https://github.com/user-attachments/assets/441c2af5-2ff9-4c05-ad9d-07c4679b8f89
 
 ## Run it
 
