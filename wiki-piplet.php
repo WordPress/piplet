@@ -890,9 +890,9 @@ function piplet_cli(array $arguments): never
             exit(0);
         }
         fwrite(STDERR, "Usage:\n"
-            . "  php piplet.php --check\n"
-            . "  php piplet.php --rekey\n"
-            . "  php piplet.php --import-snapshot-data BACKUP --rekey\n");
+            . "  php wiki-piplet.php --check\n"
+            . "  php wiki-piplet.php --rekey\n"
+            . "  php wiki-piplet.php --import-snapshot-data BACKUP --rekey\n");
         exit(64);
     } catch (Throwable $error) {
         fwrite(STDERR, "piplet: {$error->getMessage()}\n");
@@ -1422,7 +1422,7 @@ function piplet_download(bool $head = false): never
         exit('The snapshot could not be opened.');
     }
     header('Content-Type: application/octet-stream');
-    header('Content-Disposition: attachment; filename="piplet-snapshot.php"');
+    header('Content-Disposition: attachment; filename="wiki-piplet-snapshot.php"');
     header('Content-Length: ' . (string) $stat['size']);
     header('Cache-Control: no-store');
     header('X-Content-Type-Options: nosniff');

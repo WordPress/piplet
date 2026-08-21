@@ -3,13 +3,25 @@
 piplet is a small, self-modifying wiki. Its PHP, HTML, CSS, JavaScript, and every note live in one deployable file. There is no database, package install, build step, or network dependency.
 
 ```text
-piplet.php
+wiki-piplet.php
 ├── PHP persistence and HTTP API
 ├── HTML, editable CSS, and browser UI
 ├── __halt_compiler();
 ├── PIPLET-DATA/2
 └── { generation, versioned JSON notes, and appearance }
 ```
+
+## Demos
+
+Click a preview to watch the corresponding MP4.
+
+### Full version
+
+[![Watch the full piplet demo](wiki-piplet-demo.jpg)](wiki-piplet-demo.mp4)
+
+### Unsafe version
+
+[![Watch the unsafe piplet demo](wiki-piplet-unsafe-demo.jpg)](wiki-piplet-unsafe-demo.mp4)
 
 ## Run it
 
@@ -18,7 +30,7 @@ piplet.php
 ```sh
 install -d -m 700 /absolute/private/piplet-local &&
 test ! -e /absolute/private/piplet-local/index.php &&
-install -m 600 piplet.php /absolute/private/piplet-local/index.php
+install -m 600 wiki-piplet.php /absolute/private/piplet-local/index.php
 ```
 
 Start and restart it separately; never repeat the install command over the stateful copy:
@@ -124,13 +136,13 @@ Stored note text is never evaluated as PHP and is added to the page with DOM tex
 
 ## Unsafe simple version
 
-[`piplet-unsafe.php`](piplet-unsafe.php) keeps only the core trick: multiple reading pages, a separate editor with live preview, and JSON after `__halt_compiler()`. It rewrites itself directly. It has no authentication, CSRF protection, validation, atomic replacement, crash recovery, or conflict handling. Keep it on loopback, use a disposable copy, and keep a backup.
+[`wiki-piplet-unsafe.php`](wiki-piplet-unsafe.php) keeps only the core trick: multiple reading pages, a separate editor with live preview, and JSON after `__halt_compiler()`. It rewrites itself directly. It has no authentication, CSRF protection, validation, atomic replacement, crash recovery, or conflict handling. Keep it on loopback, use a disposable copy, and keep a backup.
 
 ```sh
 php -S 127.0.0.1:8080
 ```
 
-Then open `http://127.0.0.1:8080/piplet-unsafe.php`.
+Then open `http://127.0.0.1:8080/wiki-piplet-unsafe.php`.
 
 ## Test it
 

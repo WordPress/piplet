@@ -14,7 +14,7 @@ if (($argv[1] ?? '') === '--worker') {
 }
 
 $root = dirname(__DIR__);
-$source = $root . '/piplet.php';
+$source = $root . '/wiki-piplet.php';
 $temporaryRoot = sys_get_temp_dir() . '/piplet-tests-' . bin2hex(random_bytes(6));
 $copy = $temporaryRoot . '/index.php';
 $sourceHashBefore = is_file($source) ? hash_file('sha256', $source) : false;
@@ -153,7 +153,7 @@ function worker_main(array $arguments): never
     $action = $arguments[3] ?? '';
     $encoded = $arguments[4] ?? '';
     $realTarget = realpath($target);
-    $realSource = realpath(dirname(__DIR__) . '/piplet.php');
+    $realSource = realpath(dirname(__DIR__) . '/wiki-piplet.php');
     $workerRoot = realpath((string) getenv('PIPLET_TEST_ROOT'));
     $targetStat = $realTarget === false ? false : lstat($realTarget);
     $allowedTarget = is_string($realTarget) && is_array($targetStat)
@@ -865,7 +865,7 @@ function stop_live_workers(): bool
 
 $exitStatus = 0;
 try {
-    check(is_file($source), 'piplet.php is missing.');
+    check(is_file($source), 'wiki-piplet.php is missing.');
     check(mkdir($temporaryRoot, 0700), 'Could not create the test directory.');
     $temporaryRootOwned = true;
     $temporaryRootIdentity = lstat($temporaryRoot);
@@ -1161,8 +1161,8 @@ PHP;
     unset($limitDocument, $limitJson, $overLimitJson, $denseStoredJson, $denseBase);
     $numericIdFailure = finish_worker(start_worker($copy, 'numeric-id', []), 2);
     check(str_contains($numericIdFailure['stderr'], 'Invalid note identifier'), 'A stored numeric-only note identifier passed validation.');
-    check(worker_command($copy, 'cookie-path', ['script' => '/notes./piplet.php']) === '/notes./', 'A trailing dot was stripped from the CSRF cookie directory.');
-    check(worker_command($copy, 'cookie-path', ['script' => '/piplet.php']) === '/', 'The root CSRF cookie path was malformed.');
+    check(worker_command($copy, 'cookie-path', ['script' => '/notes./wiki-piplet.php']) === '/notes./', 'A trailing dot was stripped from the CSRF cookie directory.');
+    check(worker_command($copy, 'cookie-path', ['script' => '/wiki-piplet.php']) === '/', 'The root CSRF cookie path was malformed.');
     foreach ([null, '', '0', 'off', 'OFF'] as $httpsValue) {
         $httpsInput = $httpsValue === null ? [] : ['https' => $httpsValue];
         check(worker_command($copy, 'request-is-https', $httpsInput) === false,
@@ -3380,7 +3380,7 @@ PHP;
         check(header_value($downloadHeaders, 'Content-Type') === 'application/octet-stream'
             && strtolower((string) header_value($downloadHeaders, 'X-Content-Type-Options')) === 'nosniff'
             && strtolower((string) header_value($downloadHeaders, 'Cache-Control')) === 'no-store'
-            && header_value($downloadHeaders, 'Content-Disposition') === 'attachment; filename="piplet-snapshot.php"',
+            && header_value($downloadHeaders, 'Content-Disposition') === 'attachment; filename="wiki-piplet-snapshot.php"',
             'Snapshot download headers permit sniffing or an ambiguous filename.');
         check((int) header_value($downloadHeaders, 'Content-Length') === strlen($downloadBody), 'Snapshot Content-Length did not match its inode.');
         check($downloadBody === file_get_contents($httpCopy), 'The downloaded snapshot was not an exact restorable copy.');
@@ -3571,7 +3571,7 @@ PHP;
     );
     try {
         [$runnerStatus, , $runnerBody] = http_request(
-            "http://127.0.0.1:$runnerPort/run.php?--worker=../piplet.php"
+            "http://127.0.0.1:$runnerPort/run.php?--worker=../wiki-piplet.php"
         );
         check($runnerStatus === 404 && trim($runnerBody) === 'Not found.'
             && hash_file('sha256', __FILE__) === $runnerHashBefore

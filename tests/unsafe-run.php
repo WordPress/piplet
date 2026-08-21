@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-$source = dirname(__DIR__) . '/piplet-unsafe.php';
+$source = dirname(__DIR__) . '/wiki-piplet-unsafe.php';
 $sourceHash = hash_file('sha256', $source);
 $root = sys_get_temp_dir() . '/piplet-unsafe-test-' . bin2hex(random_bytes(5));
 $copy = "$root/index.php";
